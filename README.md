@@ -30,8 +30,8 @@ High-level goal
        ▼
 ┌──────────────────────────────────────────────────┐
 │ jev-mobile                                       │
-│  observe → wait for stable UI → normalize         │
-│  → build valid actions → Jev → execute            │
+│  observe → wait for stable UI → normalize        │
+│  → build valid actions → Jev → execute           │
 └──────────────────────────────────────────────────┘
        │
        ├── Mobile MCP / Android device
