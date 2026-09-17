@@ -34,6 +34,8 @@ class Settings:
     llm_model: str | None = None
     typesafe_api_key: str | None = None
     agent_system_prompt: str | None = None
+    bridge_port: int = 8765
+    bridge_token: str | None = None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -70,4 +72,6 @@ class Settings:
             llm_model=os.getenv("LLM_MODEL") or None,
             typesafe_api_key=os.getenv("TYPESAFE_API_KEY") or None,
             agent_system_prompt=os.getenv("MOBILE_AGENT_SYSTEM_PROMPT") or None,
+            bridge_port=int(os.getenv("JEV_MOBILE_BRIDGE_PORT", "8765")),
+            bridge_token=os.getenv("JEV_MOBILE_BRIDGE_TOKEN") or None,
         )

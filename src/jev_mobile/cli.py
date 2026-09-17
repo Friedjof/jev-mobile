@@ -9,7 +9,8 @@ from .actions.builder import build_action_page
 from .cli_output import RunReporter, console, render_actions, render_decision, render_result, render_state
 from .config import Settings
 from .controller.loop import MobileController
-from .device.mobile_mcp import MobileMcpAdapter
+from .device.mobile_mcp import MobileMcpAdapter, MobileMcpError
+from .device.accessibility_adb import AccessibilityAdbAdapter
 from .providers.heuristic import HeuristicProvider
 from .providers.jev import JevProvider
 from .providers.llm import LLMProvider
@@ -34,6 +35,18 @@ def _provider(name: str, settings: Settings):
     raise typer.BadParameter("provider must be mock, heuristic, llm, system-one-llm, or jev")
 
 
+def _device(backend: str, settings: Settings, serial: str | None):
+    """Create a backend without leaking transport details into controller code."""
+    selected_serial = serial or settings.device_serial
+    if backend == "mobile-mcp":
+        return MobileMcpAdapter(settings.mobile_mcp_command, selected_serial)
+    if backend == "bridge":
+        if not selected_serial:
+            raise typer.BadParameter("--serial (or MOBILE_DEVICE_SERIAL) is required for --backend bridge")
+        return AccessibilityAdbAdapter(selected_serial, port=settings.bridge_port, bridge_token=settings.bridge_token)
+    raise typer.BadParameter("backend must be mobile-mcp or bridge")
+
+
 @app.command()
 def devices() -> None:
     """List Android devices through the configured Mobile MCP server."""
@@ -53,20 +66,31 @@ def devices() -> None:
             for item in devices:
                 table.add_row(item.get("id", "?"), item.get("name", "?"), item.get("version", "?"), item.get("state", "?"))
             console.print(table)
-    asyncio.run(run())
+    try:
+        asyncio.run(run())
+    except MobileMcpError as error:
+        typer.echo(f"Device unavailable: {error}", err=True)
+        raise typer.Exit(2) from error
 
 
 @app.command()
-def inspect(serial: str | None = typer.Option(None)) -> None:
+def inspect(
+    serial: str | None = typer.Option(None),
+    backend: str = typer.Option("mobile-mcp", "--backend", help="mobile-mcp or bridge"),
+) -> None:
     """Observe without performing an action, then print semantic state and candidates."""
     async def run() -> None:
         settings = Settings.from_env()
-        async with MobileMcpAdapter(settings.mobile_mcp_command, serial or settings.device_serial) as device:
+        async with _device(backend, settings, serial) as device:
             state = normalize(await device.observe())
             render_state(state)
             page = build_action_page(state, "")
             render_actions(page.actions, page)
-    asyncio.run(run())
+    try:
+        asyncio.run(run())
+    except MobileMcpError as error:
+        typer.echo(f"Device unavailable: {error}", err=True)
+        raise typer.Exit(2) from error
 
 
 @app.command()
@@ -74,6 +98,7 @@ def decide(
     goal: str = typer.Option(...),
     provider: str = typer.Option("jev"),
     serial: str | None = typer.Option(None),
+    backend: str = typer.Option("mobile-mcp", "--backend", help="mobile-mcp or bridge"),
 ) -> None:
     """Observe and obtain a decision without changing the phone."""
     async def evaluate() -> None:
@@ -82,7 +107,7 @@ def decide(
         if provider == "jev" and not settings.typesafe_api_key:
             typer.echo("Decision unavailable: TYPESAFE_API_KEY is not configured", err=True)
             raise typer.Exit(2)
-        async with MobileMcpAdapter(settings.mobile_mcp_command, serial or settings.device_serial) as device:
+        async with _device(backend, settings, serial) as device:
             state = normalize(await device.observe())
             page = build_action_page(state, goal, page_size=settings.action_page_size, max_pages=settings.max_action_pages)
             actions = page.actions
@@ -95,7 +120,11 @@ def decide(
             render_state(state)
             render_actions(actions, page)
             render_decision(provider, result, probability_margin(result.probabilities or {}), actions)
-    asyncio.run(evaluate())
+    try:
+        asyncio.run(evaluate())
+    except MobileMcpError as error:
+        typer.echo(f"Device unavailable: {error}", err=True)
+        raise typer.Exit(2) from error
 
 
 @app.command()
@@ -103,6 +132,7 @@ def run(
     goal: str = typer.Option(...),
     provider: str = typer.Option("heuristic"),
     serial: str | None = typer.Option(None),
+    backend: str = typer.Option("mobile-mcp", "--backend", help="mobile-mcp or bridge"),
     start_app: str | None = typer.Option(None, "--start-app", help="Launch a known safe starting app before the Jev loop."),
     confidence_threshold: float | None = typer.Option(None, "--confidence-threshold", min=0.0, max=1.0),
     minimum_probability_margin: float | None = typer.Option(None, "--minimum-probability-margin", min=0.0, max=1.0),
@@ -135,11 +165,15 @@ def run(
                 max_recoveries=settings.max_plan_recoveries,
                 plan_first=plan_first,
             )
-        async with MobileMcpAdapter(settings.mobile_mcp_command, serial or settings.device_serial) as device:
+        async with _device(backend, settings, serial) as device:
             if start_app:
                 console.print(f"[cyan]Bootstrap:[/] launching {start_app}")
                 await device.launch_app(start_app)
             trace = TraceWriter(settings.trace_dir)
             result = await MobileController(device, decision_provider, settings, trace, RunReporter()).run(goal)
             render_result(result.status.value, result.message, trace.path)
-    asyncio.run(execute())
+    try:
+        asyncio.run(execute())
+    except MobileMcpError as error:
+        typer.echo(f"Device unavailable: {error}", err=True)
+        raise typer.Exit(2) from error

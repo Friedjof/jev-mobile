@@ -6,3 +6,6 @@ traces/*.jsonl
 traces/*.checkpoint.json
 traces/*.escalation.png
 .DS_Store
+android/jev-mobile-bridge/local.properties
+android/jev-mobile-bridge/.gradle/
+android/jev-mobile-bridge/app/build/

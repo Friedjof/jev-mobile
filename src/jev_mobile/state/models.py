@@ -18,6 +18,7 @@ class Bounds(BaseModel):
 
 
 class RawDeviceElement(BaseModel):
+    node_id: str | None = None
     text: str | None = None
     content_description: str | None = None
     resource_id: str | None = None
@@ -31,6 +32,17 @@ class RawDeviceElement(BaseModel):
     visible: bool = True
     scrollable: bool = False
     focused: bool = False
+    focusable: bool = False
+    checkable: bool = False
+    checked: bool = False
+    password: bool = False
+    multiline: bool = False
+    hint: str | None = None
+    state_description: str | None = None
+    available_actions: list[str] = Field(default_factory=list)
+    window_id: int | None = None
+    parent_id: str | None = None
+    child_ids: list[str] = Field(default_factory=list)
     depth: int = 0
     extras: dict[str, Any] = Field(default_factory=dict)
 
@@ -43,6 +55,9 @@ class RawDeviceState(BaseModel):
     snapshot_id: str | None = None
     truncated: bool = False
     observed_at_monotonic: float = 0.0
+    keyboard_visible: bool = False
+    focused_element_id: str | None = None
+    active_window_id: int | None = None
 
 
 class DialogKind(StrEnum):
@@ -73,6 +88,17 @@ class SemanticElement(BaseModel):
     visible: bool
     scrollable: bool
     focused: bool = False
+    focusable: bool = False
+    checkable: bool = False
+    checked: bool = False
+    password: bool = False
+    multiline: bool = False
+    hint: str | None = None
+    state_description: str | None = None
+    available_actions: list[str] = Field(default_factory=list)
+    window_id: int | None = None
+    parent_id: str | None = None
+    child_ids: list[str] = Field(default_factory=list)
     depth: int
     raw_index: int
 
@@ -86,3 +112,6 @@ class SemanticState(BaseModel):
     dialog: DialogInfo | None = None
     truncated: bool = False
     raw_snapshot_id: str | None = None
+    keyboard_visible: bool = False
+    focused_element_id: str | None = None
+    active_window_id: int | None = None

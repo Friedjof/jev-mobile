@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Jev Mobile Bridge</string>
+    <string name="accessibility_service_description">Provides a local USB-forwarded semantic UI bridge for jev-mobile.</string>
+</resources>

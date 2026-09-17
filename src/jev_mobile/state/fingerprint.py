@@ -12,6 +12,7 @@ def semantic_fingerprint(state: SemanticState) -> str:
         "app": state.app, "screen": state.screen_hint, "loading": state.loading,
         "elements": [(item.role, item.label, item.resource_id, item.package, item.clickable, item.editable,
                       item.enabled, item.selected, item.visible, item.scrollable,
+                      item.focused, item.checkable, item.checked, item.available_actions,
                       item.bounds.bucket() if item.bounds else None, item.depth)
                      for item in state.elements],
     }

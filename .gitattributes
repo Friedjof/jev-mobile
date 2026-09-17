@@ -1,0 +1,3 @@
+# Keep the generated Windows Gradle launcher portable without treating CRLF
+# line endings as whitespace in repository checks.
+*.bat text eol=crlf

@@ -1,0 +1,83 @@
+name: Python and Docker MCP
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "Dockerfile"
+      - ".dockerignore"
+      - ".github/workflows/python-docker.yml"
+  pull_request:
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "Dockerfile"
+      - ".dockerignore"
+      - ".github/workflows/python-docker.yml"
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/jev-mobile-mcp
+
+jobs:
+  lint-test-build:
+    name: Lint, test, and build MCP image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install locked dependencies
+        run: uv sync --frozen --all-groups
+      - name: Lint
+        run: uv run ruff check .
+      - name: Test
+        run: uv run pytest -q
+      - name: Verify MCP server tools
+        run: |
+          uv run python - <<'PY'
+          import asyncio
+          from jev_mobile.mcp_server import server
+
+          names = {tool.name for tool in asyncio.run(server.list_tools())}
+          assert {"mobile_agent_inspect", "mobile_agent_decide", "mobile_agent_run"} <= names
+          print("MCP tools:", ", ".join(sorted(names)))
+          PY
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GitHub Container Registry
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: metadata
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-
+      - name: Build and publish MCP image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name == 'push' }}
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -81,6 +81,10 @@ The live CLI shows the current stable UI, candidate actions, Jev confidence and 
 - Ranked action pages that prevent crowded screens from overwhelming Jev
 - Conservative popup detection with safe dismissal or screenshot-backed escalation
 - Human-friendly `devices`, `inspect`, `decide`, and `run` CLI output
+- An in-repository Android Accessibility Bridge PoC with real node actions and
+  USB-only ADB forwarding (manual service enablement required)
+- A stdio MCP server exposing bounded `mobile_agent_inspect`,
+  `mobile_agent_decide`, and `mobile_agent_run` operations
 
 ### Deliberately not solved yet
 
@@ -88,7 +92,7 @@ The live CLI shows the current stable UI, candidate actions, Jev confidence and 
 - Vision-first or screenshot-driven navigation
 - Reliable text-search handling across all Android variants
 - Human approval UX, task resume CLI, benchmarking dashboard, and OpenClaw integration
-- Docker packaging and a hosted service
+- A hosted service
 
 ## Installation
 
@@ -141,6 +145,39 @@ uv run jev-mobile run \
   --serial YOUR_ANDROID_SERIAL \
   --start-app com.android.settings
 ```
+
+### Accessibility Bridge PoC
+
+Mobile MCP remains the default backend. For richer Android semantics, this
+repository now also contains a tiny first-party companion app under
+[`android/jev-mobile-bridge`](android/jev-mobile-bridge). It runs an Android
+`AccessibilityService` and gives the controller real node capabilities such as
+`CLICK`, `SET_TEXT`, check state, hints, resource IDs, window context, and the
+node hierarchy. This removes the current Mobile MCP adapter's need to infer
+whether a coordinate-labelled element is actionable.
+
+The bridge binds only to loopback on the phone. The Python process creates a
+temporary USB tunnel with `adb forward`; it does not expose a phone port to the
+LAN or use a cloud relay. Android still requires that you explicitly enable the
+service on the device:
+
+```bash
+uv run jev-mobile inspect --backend bridge --serial YOUR_ANDROID_SERIAL
+
+# A dry run: asks Jev, but does not touch the device.
+uv run jev-mobile decide \
+  --backend bridge \
+  --goal "Open Network & internet" \
+  --provider jev \
+  --serial YOUR_ANDROID_SERIAL
+```
+
+See the bridge's [development and security notes](android/jev-mobile-bridge/README.md).
+
+> On Android 11, Mobile Next's DeviceServer starts `UiAutomation`, which
+> suppresses third-party Accessibility Services unless it opts out with
+> `FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES`. Use either Mobile MCP's UI-tree
+> backend or the bridge at a time—not both—until that upstream flag is enabled.
 
 `run` executes read-only navigation and explicitly classified reversible candidates in the current PoC. External-effect and sensitive actions always create an escalation checkpoint. The default confidence threshold is `0.80`; low-confidence or low-margin decisions also create an escalation checkpoint instead of acting.
 
@@ -200,25 +237,62 @@ The Jev provider uses the official `AsyncTypeSafeClient`. A Choice response is r
 ## Development
 
 ```bash
-uv run pytest
+uv run ruff check .
+uv run pytest -q
 uv run python scripts/test_jev.py
 ```
 
 The smoke test requires `TYPESAFE_API_KEY` and intentionally logs only selected action, probabilities, latency, model name, and token accounting.
 
-## Future MCP integration
+## Docker MCP server
 
-The standalone control loop comes first. Once it is reliable, `jev-mobile` can expose a small MCP server for higher-level orchestrators such as OpenClaw:
+The repository ships a stdio MCP image. It exposes the same bounded controller
+operations as the CLI; it does not expose arbitrary ADB commands or coordinate
+taps. A container still needs deliberate access to an ADB server and the
+Android bridge when it is used with a real phone.
+
+```bash
+docker build -t jev-mobile-mcp .
+docker run -i --rm \
+  -e TYPESAFE_API_KEY \
+  -e MOBILE_DEVICE_SERIAL \
+  jev-mobile-mcp
+```
+
+The process communicates over standard input/output, as required by MCP. For
+the bridge backend, provide ADB connectivity explicitly; do not bake USB
+permissions, device serials, or credentials into the image.
+
+## CI and releases
+
+- Android bridge changes run Android lint and produce a debug APK artifact.
+- Python/controller changes run Ruff, tests, an MCP-tool smoke test, and build
+  the container image. Pushes publish branch and SHA tags to GHCR.
+- Pushing a tag shaped as `vX.Y.Z` runs both test suites, publishes
+  `ghcr.io/<owner>/jev-mobile-mcp` with version and `latest` tags, and creates
+  a GitHub Release containing the installable PoC debug APK.
+
+The release APK is deliberately debug-signed while this project remains a PoC.
+Introduce a protected Android signing-key workflow before distributing a
+production build.
+
+## MCP integration
+
+`jev-mobile-mcp` is a small stdio MCP server for higher-level orchestrators
+such as OpenClaw. It currently exposes inspection, dry-run decision, and the
+bounded controller run:
 
 ```text
 mobile_agent_run(goal)
-mobile_agent_status(task_id)
-mobile_agent_resume(task_id, instruction)
-mobile_agent_stop(task_id)
 mobile_agent_inspect()
+mobile_agent_decide(goal)
+mobile_agent_run(goal)
 ```
 
-That makes a useful split possible: an orchestrator starts a goal, the local Jev loop handles fast structured navigation, and a stronger model is called only for ambiguity, vision, language generation, or sensitive decisions.
+Status, resume, and stop tools will follow with durable task storage. The
+existing split remains intentional: an orchestrator starts a goal, the local
+Jev loop handles fast structured navigation, and a stronger model is called
+only for ambiguity, vision, language generation, or sensitive decisions.
 
 ## License
 

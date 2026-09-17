@@ -71,9 +71,15 @@ def normalize(raw: RawDeviceState) -> SemanticState:
         label, role = _clean(item.text) or _clean(item.content_description), _role(item)
         if role == "progressbar" or (label and label.casefold() in {"loading", "laden", "please wait"}): loading = True
         elements.append(SemanticElement(
-            id=f"e{index + 1}", role=role, label=label, resource_id=item.resource_id, package=item.package, bounds=item.bounds,
+            id=item.node_id or f"e{index + 1}", role=role, label=label, resource_id=item.resource_id, package=item.package, bounds=item.bounds,
             clickable=item.clickable, editable=item.editable, enabled=item.enabled, selected=item.selected,
-            visible=item.visible, scrollable=item.scrollable, focused=item.focused, depth=item.depth, raw_index=index))
+            visible=item.visible, scrollable=item.scrollable, focused=item.focused, focusable=item.focusable,
+            checkable=item.checkable, checked=item.checked, password=item.password, multiline=item.multiline,
+            hint=_clean(item.hint), state_description=_clean(item.state_description),
+            available_actions=item.available_actions, window_id=item.window_id, parent_id=item.parent_id,
+            child_ids=item.child_ids, depth=item.depth, raw_index=index))
     state = SemanticState(app=raw.package, screen_hint=raw.activity, elements=elements, fingerprint="",
-                          loading=loading, dialog=_dialog(elements), truncated=raw.truncated, raw_snapshot_id=raw.snapshot_id)
+                          loading=loading, dialog=_dialog(elements), truncated=raw.truncated, raw_snapshot_id=raw.snapshot_id,
+                          keyboard_visible=raw.keyboard_visible, focused_element_id=raw.focused_element_id,
+                          active_window_id=raw.active_window_id)
     return state.model_copy(update={"fingerprint": semantic_fingerprint(state)})

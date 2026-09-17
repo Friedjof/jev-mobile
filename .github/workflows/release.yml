@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/jev-mobile-mcp
+
+jobs:
+  release:
+    name: Build and publish ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install locked dependencies
+        run: uv sync --frozen --all-groups
+      - name: Lint Python
+        run: uv run ruff check .
+      - name: Test Python
+        run: uv run pytest -q
+      - name: Verify MCP server tools
+        run: |
+          uv run python - <<'PY'
+          import asyncio
+          from jev_mobile.mcp_server import server
+
+          names = {tool.name for tool in asyncio.run(server.list_tools())}
+          assert {"mobile_agent_inspect", "mobile_agent_decide", "mobile_agent_run"} <= names
+          PY
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+      - name: Verify Gradle wrapper
+        uses: gradle/actions/wrapper-validation@v4
+      - name: Lint and build installable APK
+        working-directory: android/jev-mobile-bridge
+        run: ./gradlew --no-daemon lint assembleDebug
+      - name: Name release APK
+        run: cp android/jev-mobile-bridge/app/build/outputs/apk/debug/app-debug.apk "jev-mobile-bridge-${GITHUB_REF_NAME}-debug.apk"
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: metadata
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+      - name: Build and publish release MCP image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Create GitHub release and upload APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" "jev-mobile-bridge-${GITHUB_REF_NAME}-debug.apk" --generate-notes --title "Jev Mobile ${GITHUB_REF_NAME}"
