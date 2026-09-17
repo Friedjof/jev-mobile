@@ -4,6 +4,8 @@ import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.graphics.Rect
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
@@ -19,6 +21,7 @@ import java.nio.charset.StandardCharsets
 import java.util.ArrayDeque
 import java.security.SecureRandom
 import java.util.concurrent.Executors
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -34,6 +37,14 @@ class JevAccessibilityService : AccessibilityService() {
     // accept threads and exhaust a small phone's memory.
     private val acceptExecutor = Executors.newSingleThreadExecutor()
     private val requestExecutor = Executors.newFixedThreadPool(2)
+    private val actionExecutor = Executors.newSingleThreadExecutor()
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private data class ActionReceipt(
+        val requestId: String, val acceptedAt: Long, val sequenceBefore: Long,
+        @Volatile var executedAt: Long? = null, @Volatile var androidResult: Boolean? = null,
+        @Volatile var status: String = "ACCEPTED",
+    )
+    private val actionReceipts = ConcurrentHashMap<String, ActionReceipt>()
     private val events = ArrayDeque<JSONObject>()
     private val eventLock = Any()
     @Volatile private var sequence = 0L
@@ -91,6 +102,7 @@ class JevAccessibilityService : AccessibilityService() {
         server?.close()
         acceptExecutor.shutdownNow()
         requestExecutor.shutdownNow()
+        actionExecutor.shutdownNow()
         super.onDestroy()
     }
 
@@ -135,11 +147,13 @@ class JevAccessibilityService : AccessibilityService() {
                 if (read < 0) break
                 offset += read
             }
-            val response = when (parts[0] to parts[1]) {
-                "GET" to "/health" -> JSONObject().put("ok", true).put("service", "jev-mobile-bridge").put("authentication", "required")
-                "GET" to "/state" -> authenticated(headers) { buildState() }
-                "GET" to "/events" -> authenticated(headers) { buildEvents() }
-                "POST" to "/action" -> authenticated(headers) { performAction(JSONObject(String(body))) }
+            val response = when {
+                parts[0] == "GET" && parts[1] == "/health" -> JSONObject().put("ok", true).put("service", "jev-mobile-bridge").put("authentication", "required")
+                parts[0] == "GET" && parts[1] == "/state" -> authenticated(headers) { buildState() }
+                parts[0] == "GET" && parts[1] == "/events" -> authenticated(headers) { buildEvents() }
+                parts[0] == "GET" && parts[1].startsWith("/action/") -> authenticated(headers) { actionStatus(parts[1].removePrefix("/action/")) }
+                parts[0] == "POST" && parts[1] == "/action" -> authenticated(headers) { performAction(JSONObject(String(body))) }
+                parts[0] == "POST" && parts[1] == "/input" -> authenticated(headers) { performInput(JSONObject(String(body))) }
                 else -> error("Unknown endpoint")
             }
             respond(it.getOutputStream(), if (response.optBoolean("ok", true)) 200 else 400, response)
@@ -220,21 +234,73 @@ class JevAccessibilityService : AccessibilityService() {
         val action = request.optString("type")
         val target = request.optString("target")
         val node = resolveNode(target) ?: return error("Unknown or stale target")
-        return try {
-            val success = when (action) {
-                "click" -> node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                "focus" -> node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-                "set_text" -> node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, Bundle().apply {
-                    putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, request.optString("text"))
-                })
-                "scroll_forward" -> node.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)
-                "scroll_backward" -> node.performAction(AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD)
-                else -> false
+        val actionId = when (action) {
+            "click" -> AccessibilityNodeInfo.ACTION_CLICK
+            "focus" -> AccessibilityNodeInfo.ACTION_FOCUS
+            "set_text" -> AccessibilityNodeInfo.ACTION_SET_TEXT
+            "scroll_forward" -> AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
+            "scroll_backward" -> AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+            else -> {
+                node.recycle()
+                return error("Unsupported action")
             }
-            if (success) JSONObject().put("ok", true) else error("Action was rejected by Android")
-        } finally {
-            node.recycle()
         }
+        val requestId = request.optString("request_id").ifBlank { java.util.UUID.randomUUID().toString() }
+        val receipt = ActionReceipt(requestId, System.currentTimeMillis(), sequence)
+        actionReceipts[requestId] = receipt
+        // A response acknowledges scheduling only. Some OEM accessibility
+        // implementations block inside performAction even after the visible
+        // mutation occurred, so correctness belongs to the next observation.
+        val nodeCopy = AccessibilityNodeInfo.obtain(node)
+        node.recycle()
+        actionExecutor.execute {
+            mainHandler.post {
+                try {
+                    val args = if (action == "set_text") Bundle().apply {
+                        putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, request.optString("text"))
+                    } else null
+                    receipt.androidResult = if (args == null) nodeCopy.performAction(actionId) else nodeCopy.performAction(actionId, args)
+                    receipt.status = if (receipt.androidResult == true) "EXECUTED" else "REJECTED"
+                } catch (error: Exception) {
+                    Log.w(TAG, "Accessibility action failed after acceptance", error)
+                    receipt.status = "UNKNOWN"
+                } finally {
+                    receipt.executedAt = System.currentTimeMillis()
+                    nodeCopy.recycle()
+                }
+            }
+        }
+        return JSONObject().put("ok", true).put("accepted", true).put("request_id", requestId)
+            .put("sequence_before", receipt.sequenceBefore)
+    }
+
+    private fun actionStatus(requestId: String): JSONObject {
+        val receipt = actionReceipts[requestId] ?: return error("Unknown action request")
+        return JSONObject().put("ok", true).put("request_id", receipt.requestId)
+            .put("status", receipt.status).put("accepted_at", receipt.acceptedAt)
+            .put("executed_at", receipt.executedAt).put("android_result", receipt.androidResult)
+            .put("sequence_before", receipt.sequenceBefore).put("sequence_after", sequence)
+    }
+
+    private fun performInput(request: JSONObject): JSONObject {
+        val text = request.optString("text")
+        if (text.isEmpty()) return error("Input text is empty")
+        val requestId = request.optString("request_id").ifBlank { java.util.UUID.randomUUID().toString() }
+        val receipt = ActionReceipt(requestId, System.currentTimeMillis(), sequence)
+        actionReceipts[requestId] = receipt
+        mainHandler.post {
+            try {
+                receipt.androidResult = JevInputMethodService.commit(text)
+                receipt.status = if (receipt.androidResult == true) "EXECUTED" else "REJECTED"
+            } catch (error: Exception) {
+                Log.w(TAG, "IME input failed after acceptance", error)
+                receipt.status = "UNKNOWN"
+            } finally {
+                receipt.executedAt = System.currentTimeMillis()
+            }
+        }
+        return JSONObject().put("ok", true).put("accepted", true).put("request_id", requestId)
+            .put("sequence_before", receipt.sequenceBefore)
     }
 
     private fun resolveNode(target: String): AccessibilityNodeInfo? {

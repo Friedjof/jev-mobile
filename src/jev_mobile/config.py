@@ -39,6 +39,7 @@ class Settings:
     agent_system_prompt: str | None = None
     bridge_port: int = 8765
     bridge_token: str | None = None
+    text_input_strategy: str = "accessibility"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -57,6 +58,9 @@ class Settings:
         max_plan_recoveries = int(os.getenv("MAX_PLAN_RECOVERIES", "1"))
         if max_plan_recoveries < 0:
             raise ValueError("MAX_PLAN_RECOVERIES must not be negative")
+        text_input_strategy = os.getenv("TEXT_INPUT_STRATEGY", "accessibility").casefold()
+        if text_input_strategy not in {"accessibility", "ime"}:
+            raise ValueError("TEXT_INPUT_STRATEGY must be accessibility or ime")
         return cls(
             mobile_mcp_command=parsed, device_serial=os.getenv("MOBILE_DEVICE_SERIAL") or None,
             trace_dir=Path(os.getenv("TRACE_DIR", "traces")),
@@ -80,4 +84,5 @@ class Settings:
             agent_system_prompt=os.getenv("MOBILE_AGENT_SYSTEM_PROMPT") or None,
             bridge_port=int(os.getenv("JEV_MOBILE_BRIDGE_PORT", "8765")),
             bridge_token=os.getenv("JEV_MOBILE_BRIDGE_TOKEN") or None,
+            text_input_strategy=text_input_strategy,
         )

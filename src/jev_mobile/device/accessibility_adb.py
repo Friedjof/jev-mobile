@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+import uuid
 from collections.abc import Iterable
 
 import httpx
 
 from ..state.models import Bounds, RawDeviceElement, RawDeviceState
+from .base import MutationOutcomeUnknown, MutationReceipt, MutationRejected
 from .mobile_mcp import MobileMcpError
 
 
@@ -30,11 +32,7 @@ class AccessibilityAdbAdapter:
 
     async def __aenter__(self) -> "AccessibilityAdbAdapter":
         await self._adb("forward", f"tcp:{self.port}", f"tcp:{self.port}")
-        # ACTION_SET_TEXT can synchronously wait for an Android accessibility
-        # transaction on OEM builds. It may succeed after the former 5 s
-        # client timeout, so keep the transport patient while the controller
-        # still bounds total task runtime separately.
-        self.client = httpx.AsyncClient(base_url=self.base_url, timeout=15)
+        self.client = httpx.AsyncClient(base_url=self.base_url, timeout=5)
         try:
             response = await self.client.get("/health")
             response.raise_for_status()
@@ -91,26 +89,44 @@ class AccessibilityAdbAdapter:
             active_window_id=payload.get("active_window_id"), snapshot_id=str(payload.get("sequence", "")) or None,
         )
 
-    async def tap(self, target: str) -> None:
-        await self._action("click", target)
+    async def tap(self, target: str) -> MutationReceipt:
+        return await self._action("click", target)
 
     async def long_press(self, target: str) -> None:
         raise MobileMcpError("Long press is not exposed by the bridge MVP")
 
-    async def type_text(self, text: str, target: str | None = None) -> None:
+    async def type_text(self, text: str, target: str | None = None) -> MutationReceipt:
         if not target:
             raise MobileMcpError("Accessibility text entry requires a verified editable target")
         # ACTION_SET_TEXT is valid on an already-focused field. Focusing first
         # is actively harmful on several Android widgets because ACTION_FOCUS
         # then returns false and prevents the write from being attempted.
         try:
-            await self._action("set_text", target, text=text)
-        except MobileMcpError as initial_error:
+            return await self._action("set_text", target, text=text)
+        except MutationRejected as initial_error:
             try:
                 await self._action("focus", target)
-                await self._action("set_text", target, text=text)
-            except MobileMcpError:
+                return await self._action("set_text", target, text=text)
+            except MutationRejected:
                 raise initial_error
+
+    async def type_text_ime(self, text: str) -> MutationReceipt:
+        """Commit Unicode through the opt-in Jev companion IME.
+
+        The companion IME must be explicitly enabled and selected by the
+        device owner. This method never changes global keyboard settings.
+        """
+        request_id = uuid.uuid4().hex
+        try:
+            result = await self._request("POST", "/input", {"request_id": request_id, "text": text})
+        except httpx.TimeoutException as error:
+            raise MutationOutcomeUnknown("Bridge IME receipt lost; input may have run") from error
+        except MobileMcpError as error:
+            raise MutationRejected(str(error)) from error
+        if not result.get("accepted"):
+            raise MutationRejected(result.get("error", "IME input was rejected"))
+        return MutationReceipt(request_id=result.get("request_id", request_id), status="accepted",
+                               sequence_before=result.get("sequence_before"))
 
     async def swipe(self, direction: str) -> None:
         if not self._scroll_target:
@@ -126,20 +142,33 @@ class AccessibilityAdbAdapter:
     async def screenshot(self) -> bytes:
         return await self._adb("exec-out", "screencap", "-p", binary=True)
 
-    async def _action(self, action_type: str, target: str, *, text: str | None = None) -> None:
-        body: dict[str, str] = {"type": action_type, "target": target}
+    async def _action(self, action_type: str, target: str, *, text: str | None = None) -> MutationReceipt:
+        request_id = uuid.uuid4().hex
+        body: dict[str, str] = {"request_id": request_id, "type": action_type, "target": target}
         if text is not None:
             body["text"] = text
-        result = await self._request("POST", "/action", body)
-        if not result.get("ok"):
-            raise MobileMcpError(result.get("error", "Accessibility action failed"))
+        try:
+            result = await self._request("POST", "/action", body)
+        except httpx.TimeoutException as error:
+            raise MutationOutcomeUnknown(f"Bridge receipt lost for {action_type}; mutation may have run") from error
+        except MobileMcpError as error:
+            raise MutationRejected(str(error)) from error
+        if not result.get("accepted"):
+            raise MutationRejected(result.get("error", "Accessibility action was rejected"))
+        return MutationReceipt(request_id=result.get("request_id", request_id), status="accepted",
+                               sequence_before=result.get("sequence_before"))
 
     async def _request(self, method: str, path: str, body: dict[str, str] | None = None) -> dict:
         if not self.client:
             raise MobileMcpError("Bridge adapter is not connected")
-        response = await self.client.request(
-            method, path, json=body, headers={"X-Jev-Mobile-Token": self._bridge_token or ""},
-        )
+        try:
+            response = await self.client.request(
+                method, path, json=body, headers={"X-Jev-Mobile-Token": self._bridge_token or ""},
+            )
+        except httpx.TimeoutException:
+            raise
+        except httpx.HTTPError as error:
+            raise MobileMcpError(f"Bridge request failed ({type(error).__name__})") from error
         if response.is_error:
             try:
                 detail = response.json().get("error")
