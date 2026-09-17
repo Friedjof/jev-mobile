@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 from pydantic import BaseModel
+from .mutation_family import MutationFamily
 
 
 class ActionKind(StrEnum):
@@ -14,6 +15,7 @@ class ActionKind(StrEnum):
     SCROLL_UP = "scroll_up"
     BACK = "back"
     LAUNCH_APP = "launch_app"
+    OPEN_APP_ROOT = "open_app_root"
     WAIT = "wait"
     MORE_ACTIONS = "more_actions"
     SELECT_GROUP = "select_group"
@@ -36,10 +38,12 @@ class CandidateAction(BaseModel):
     kind: ActionKind
     label: str
     target_element_id: str | None = None
+    target_descriptor: dict[str, object] | None = None
     text: str | None = None
     package: str | None = None
     risk: ActionRisk = ActionRisk.READ_ONLY
     goal_directed: bool = False
+    mutation_family: MutationFamily = MutationFamily.OTHER
 
 
 class ActionPage(BaseModel):
