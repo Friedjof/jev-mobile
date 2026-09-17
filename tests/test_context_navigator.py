@@ -63,3 +63,23 @@ def test_context_keeps_twelve_recent_semantic_transitions() -> None:
     compact = context.compact()
     assert len(compact["recent_transitions"]) == 12
     assert compact["recent_transitions"][-1]["outcome"] == "progress"
+
+
+def test_ambiguous_text_mutation_is_recorded_before_transport_and_resolved_by_observation() -> None:
+    before = _state(SemanticElement(
+        id="body", role="text_field", field_name="Body", field_role="body", value=None,
+        clickable=True, editable=True, enabled=True, selected=False, visible=True,
+        scrollable=False, depth=0, raw_index=0,
+    ))
+    after = before.model_copy(update={"fingerprint": "after", "elements": [
+        before.elements[0].model_copy(update={"value": "Frischkäse"}),
+    ]})
+    context = AgentContext("Write", TaskSpec())
+    action = CandidateAction(id="A1", kind=ActionKind.TYPE_TEXT, label="Set body", target_element_id="body", text="Frischkäse")
+
+    context.begin_action(action, before)
+    context.mark_transport_outcome("unknown")
+    context.observe(after)
+
+    assert context.recent_transitions[-1]["outcome"] == "success"
+    assert "type_text:body" not in context.failed_paths

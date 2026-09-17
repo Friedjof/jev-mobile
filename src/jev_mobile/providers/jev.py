@@ -112,36 +112,42 @@ class JevProvider:
         compact = build_jev_state(goal, state)
         try:
             async with AsyncTypeSafeClient(api_key=self._api_key) as client:
+                questions = {
+                    "content_type": Choice(
+                        instructions="Classify the requested note content. Choose UNKNOWN only if wording is ambiguous.",
+                        criteria={
+                            "TEXT_NOTE": "Write the supplied content as normal note body text.",
+                            "CHECKLIST": "Create a checklist from the supplied item candidates.",
+                            "UNKNOWN": "The wording does not determine a safe content type.",
+                        },
+                    ),
+                }
+                if interpretation.title == "UNKNOWN":
+                    questions["title"] = Choice(
+                        instructions="Decide whether an explicit title is required by the task.",
+                        criteria={
+                            "NO_TITLE": "No title was explicitly requested.",
+                            "USE_PURPOSE_AS_TITLE": (
+                                f"Use the extracted purpose {interpretation.purpose!r} as a concise title."
+                                if interpretation.purpose else "No purpose candidate is available."
+                            ),
+                            "UNKNOWN": "Title intent is ambiguous and needs stronger reasoning.",
+                        },
+                    )
                 response = await client.system_one(
                     state={
                         "goal": goal,
                         "deterministic_extraction": interpretation.model_dump(mode="json"),
                         "ui": compact["screen"],
                     },
-                    questions={
-                        "content_type": Choice(
-                            instructions="Classify the requested note content. Choose UNKNOWN only if wording is ambiguous.",
-                            criteria={
-                                "TEXT_NOTE": "Write the supplied content as normal note body text.",
-                                "CHECKLIST": "Create a checklist from the supplied item candidates.",
-                                "UNKNOWN": "The wording does not determine a safe content type.",
-                            },
-                        ),
-                        "title": Choice(
-                            instructions="Decide whether an explicit title is required by the task.",
-                            criteria={
-                                "NO_TITLE": "No title was explicitly requested.",
-                                "Shopping": "Use Shopping as a concise title.",
-                                "UNKNOWN": "Title intent is ambiguous and needs stronger reasoning.",
-                            },
-                        ),
-                    },
+                    questions=questions,
                 )
         except Exception as error:
             raise ProviderUnavailable(f"Jev interpretation failed ({_safe_error_summary(error)})") from error
         content_type = response.answers["content_type"].choice
-        title = response.answers["title"].choice
-        return interpretation.model_copy(update={"content_type": content_type, "title": title})
+        title = response.answers["title"].choice if "title" in response.answers else interpretation.title
+        result = interpretation.model_copy(update={"content_type": content_type, "title": title})
+        return result.model_copy(update={"task_spec": result.to_task_spec()})
 
     async def decide(self, goal: str, state: SemanticState, actions: list[CandidateAction]) -> Decision:
         if not self._api_key:

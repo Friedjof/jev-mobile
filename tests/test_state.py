@@ -45,3 +45,23 @@ def test_deterministic_task_interpretation_extracts_shopping_items_without_llm()
     assert interpretation.purpose == "shopping"
     assert interpretation.item_candidates == ["Eier", "Brot", "Fisch", "Frischkäse", "Salat", "Essig"]
     assert interpretation.task_spec.fields[0].role == "body"
+
+
+def test_clickable_container_inherits_direct_child_accessibility_label() -> None:
+    state = normalize(RawDeviceState(elements=[
+        RawDeviceElement(node_id="row", clickable=True, child_ids=["label"]),
+        RawDeviceElement(node_id="label", text="Checkboxes"),
+    ]))
+
+    assert state.elements[0].label == "Checkboxes"
+
+
+def test_editable_sibling_of_checkbox_becomes_numbered_list_item() -> None:
+    state = normalize(RawDeviceState(elements=[
+        RawDeviceElement(node_id="check", parent_id="row", checkable=True),
+        RawDeviceElement(node_id="text", parent_id="row", editable=True, class_name="android.widget.EditText"),
+    ]))
+    field = next(element for element in state.elements if element.id == "text")
+
+    assert field.field_role == "list_item"
+    assert field.field_name == "List item 1"

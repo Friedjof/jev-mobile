@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..actions.builder import build_action_page
+from ..actions.builder import build_action_page, checklist_content_present
 from ..actions.models import ActionKind, ActionRisk, ActionPage, CandidateAction
 from ..state.models import SemanticElement, SemanticState
 from ..tasks import TaskSpec
@@ -15,6 +15,10 @@ def semantic_group(element: SemanticElement) -> str:
     """Classify controls semantically; no raw node-index pagination."""
     label = (element.label or element.field_name or "").casefold()
     resource = (element.resource_id or "").casefold()
+    # Never let status-bar controls compete with app controls merely because
+    # they look like generic clickable images or buttons.
+    if element.package == "com.android.systemui":
+        return "system"
     if element.editable:
         return "text_fields"
     if element.checkable or element.role in {"checkbox", "switch"}:
@@ -27,8 +31,6 @@ def semantic_group(element: SemanticElement) -> str:
         return "editor_actions"
     if element.clickable and element.role in {"button", "image"}:
         return "primary_actions"
-    if element.package == "com.android.systemui":
-        return "system"
     return "content"
 
 
@@ -50,6 +52,11 @@ class SemanticNavigator:
 
     def build(self, state: SemanticState, goal: str, task_spec: TaskSpec, *, can_complete: bool,
               return_mode: bool, action_page_size: int, max_action_pages: int, page_index: int = 0) -> ActionPage:
+        if task_spec.intent == "create_note" and checklist_content_present(state, task_spec):
+            return self._filter_failed(build_action_page(
+                state, goal, page_index=0, page_size=action_page_size, max_pages=max_action_pages,
+                can_complete=can_complete, return_mode=return_mode, task_spec=task_spec,
+            ))
         groups = grouped_elements(state)
         total_controls = sum(len(items) for items in groups.values())
         # Small, direct screens stay fast. Large or unfocused screens enter
@@ -64,7 +71,7 @@ class SemanticNavigator:
             subset = state.model_copy(update={"elements": selected})
             return self._filter_failed(build_action_page(
                 subset, goal, page_index=page_index, page_size=action_page_size, max_pages=max_action_pages,
-                can_complete=can_complete, return_mode=return_mode, task_spec=task_spec,
+                can_complete=can_complete, return_mode=return_mode, task_spec=task_spec, mechanical=True,
             ))
         self.context.leave_group()
         available = list(groups)
@@ -85,7 +92,7 @@ class SemanticNavigator:
             actions.append(CandidateAction(id="PREVIOUS_GROUP", kind=ActionKind.PREVIOUS_GROUP, label="Previous semantic groups"))
         actions.extend([
             CandidateAction(id="SEARCH_RELEVANT", kind=ActionKind.SEARCH_RELEVANT,
-                            label="Search the next relevant semantic group", risk=ActionRisk.READ_ONLY),
+                            label=f"Ask Jev to choose the most relevant group for: {self.context.current_subgoal}", risk=ActionRisk.READ_ONLY),
             CandidateAction(id="BACK", kind=ActionKind.BACK, label="Go back"),
             CandidateAction(id="WAIT", kind=ActionKind.WAIT, label="Wait for UI"),
             CandidateAction(id="ESCALATE", kind=ActionKind.ESCALATE, label="Escalate"),
@@ -117,9 +124,12 @@ class SemanticNavigator:
         if action.kind == ActionKind.SEARCH_RELEVANT:
             unvisited = [group for group in groups if self.context.visited_groups.get(group, 0) < 2]
             if unvisited:
-                # The current Jev choice explicitly requested search; this
-                # deterministic move only selects its next unexplored branch.
-                self.context.select_group(unvisited[0])
+                # Group candidates on the screen are the actual Jev selection
+                # interface. SEARCH_RELEVANT only resets a stale cursor so the
+                # next cheap Jev call can choose among them; it never silently
+                # picks a raw first-unvisited group.
+                self.context.leave_group()
+                self.context.group_cursor = 0
             return True
         if action.kind == ActionKind.BACK and self.context.navigation_mode == "group":
             self.context.leave_group()
@@ -131,9 +141,23 @@ class SemanticNavigator:
         """Use a cheap unvisited semantic branch before escalating to System 2."""
         if self.context.exploration_branches >= max_safe_exploration_branches:
             return False
-        for group in grouped_elements(state):
-            if self.context.visited_groups.get(group, 0) < max_group_revisits:
-                self.context.select_group(group)
-                self.context.exploration_branches += 1
-                return True
+        groups = list(grouped_elements(state))
+        subgoal = self.context.current_subgoal.casefold()
+        preferred = (
+            ("editor_actions", "menus", "checkables", "text_fields", "primary_actions", "navigation", "content", "system")
+            if any(term in subgoal for term in ("checklist", "mode", "item"))
+            else ("text_fields", "editor_actions", "primary_actions", "menus", "checkables", "navigation", "content", "system")
+            if any(term in subgoal for term in ("title", "body", "text"))
+            else GROUP_ORDER
+        )
+        ordered = [group for group in preferred if group in groups]
+        # Exhaust every unvisited relevant branch before a revisit. This
+        # prevents navigation controls from consuming the exploration budget.
+        candidates = [group for group in ordered if self.context.visited_groups.get(group, 0) == 0]
+        if not candidates:
+            candidates = [group for group in ordered if self.context.visited_groups.get(group, 0) < max_group_revisits]
+        if candidates:
+            self.context.select_group(candidates[0])
+            self.context.exploration_branches += 1
+            return True
         return False

@@ -55,7 +55,10 @@ async def test_crowded_screen_uses_semantic_group_search_without_touching_device
     result = await controller.run("Browse items")
     assert result.status.value == "escalated"
     assert "candidates" in events
-    assert device.taps == ["e11"]
+    # An unchanged mutation is re-decided rather than replayed. The scripted
+    # provider may explore other targets, but must not tap e11 twice.
+    assert device.taps[0] == "e11"
+    assert device.taps.count("e11") == 1
 
 
 async def test_opening_notes_does_not_complete_content_creation_goal(tmp_path) -> None:

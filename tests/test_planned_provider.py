@@ -61,3 +61,4 @@ async def test_plan_first_creates_plan_before_first_decision() -> None:
     assert plan.summary == "Open Settings first"
     assert planner.recent_context == [{"action": "Open app", "outcome": "Editor opened"}]
     assert "Recovery-plan checkpoint 1/1" in provider.contextual_goal("Configure Wi-Fi", state)
+    assert provider.recoveries == 0

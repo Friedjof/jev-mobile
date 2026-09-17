@@ -30,8 +30,18 @@ class UIStateStabilizer:
     async def wait_ready(self, device: DeviceAdapter, previous_fingerprint: str | None = None) -> StabilizationResult:
         started, stable_since, previous, last_state = time.monotonic(), None, None, None
         changed, interval = previous_fingerprint is None, 0.05
+        last_error: Exception | None = None
         while time.monotonic() - started < self.timeout:
-            state, now = normalize(await device.observe()), time.monotonic()
+            try:
+                state, now = normalize(await device.observe()), time.monotonic()
+            except Exception as error:
+                # Android can report no active window for a few frames while a
+                # popup or activity is being attached. This is an observation
+                # gap, not proof that the preceding mutation failed.
+                last_error = error
+                await asyncio.sleep(interval)
+                interval = min(0.2, interval * 1.5)
+                continue
             last_state = state
             changed = changed or (previous_fingerprint is not None and state.fingerprint != previous_fingerprint)
             if previous and previous.fingerprint == state.fingerprint and not state.loading:
@@ -42,6 +52,8 @@ class UIStateStabilizer:
             previous = state
             await asyncio.sleep(interval)
             interval = min(0.2, interval * 1.5)
-        assert last_state is not None
+        if last_state is None:
+            assert last_error is not None
+            raise last_error
         readiness = UiReadiness.LOADING if last_state.loading else (UiReadiness.UNCHANGED if not changed else UiReadiness.STUCK)
         return StabilizationResult(readiness, last_state, (time.monotonic() - started) * 1000)

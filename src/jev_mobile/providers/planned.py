@@ -45,7 +45,6 @@ class PlanGuidedProvider:
             return None
         self.plan = await self.planner.plan(goal, state, "initial_task_decomposition", state.recent_context)
         self._plan_origin_fingerprint = state.fingerprint
-        self.recoveries += 1
         return self.plan
 
     def contextual_goal(self, goal: str, state: SemanticState) -> str:

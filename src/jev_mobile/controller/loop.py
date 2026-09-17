@@ -7,8 +7,9 @@ from dataclasses import dataclass
 from collections.abc import Callable
 from ..actions.builder import goal_keywords
 from ..actions.models import ActionKind, ActionRisk, CandidateAction
+from ..actions.mutation_journal import MutationJournal, MutationOutcome
 from ..config import Settings
-from ..device.base import DeviceAdapter
+from ..device.base import DeviceAdapter, MutationOutcomeUnknown, MutationRejected
 from ..escalation.handler import LocalEscalationHandler
 from ..escalation.models import EscalationResult
 from ..providers.base import DecisionProvider, ProviderUnavailable
@@ -36,21 +37,29 @@ class MobileController:
         self.stabilizer = UIStateStabilizer(settings.minimum_stable_time_seconds, settings.stabilizer_timeout_seconds)
         self.escalations = LocalEscalationHandler(settings.trace_dir)
         self.on_event = on_event
+        self.mutation_journal = MutationJournal()
+        self._pending_mutation = None
 
     def _emit(self, event: str, **payload: object) -> None:
         if self.on_event:
             self.on_event(event, payload)
 
-    async def run(self, goal: str) -> RunResult:
+    async def run(self, goal: str, task_spec: TaskSpec | None = None) -> RunResult:
         started, previous, recent = time.monotonic(), None, []
-        task_spec = self._task_spec(goal)
+        supplied_task_spec = task_spec is not None
+        task_spec = task_spec or self._task_spec(goal)
         agent_context = AgentContext(goal, task_spec)
         navigator = SemanticNavigator(agent_context)
         last_action: CandidateAction | None = None
-        retry_counts: dict[tuple[str, str], int] = {}
         guard, target_open, can_complete = LoopGuard(self.settings.max_same_state_count), False, False
         pending_persistence_check = False
         jev_steps_without_progress = 0
+        last_counted_transition = 0
+        metrics = {
+            "jev_calls_total": 0, "llm_calls_total": 0, "device_mutations_total": 0,
+            "ambiguous_mutations_total": 0, "verified_mutations_total": 0,
+            "semantic_groups_visited": 0, "stale_decisions_discarded": 0,
+        }
         settings_root_fingerprint: str | None = None
         settings_root_labels: set[str] = set()
         self.trace.write(event="task_started", goal=goal, provider=self.provider.name)
@@ -61,9 +70,27 @@ class MobileController:
             stabilized = await self.stabilizer.wait_ready(self.device, previous)
             state, previous = stabilized.state, stabilized.state.fingerprint
             agent_context.observe(state)
+            if self._pending_mutation is not None:
+                transition = agent_context.recent_transitions[-1] if agent_context.recent_transitions else {}
+                transport = getattr(self._pending_mutation, "transport", None)
+                if transport == "rejected": outcome = MutationOutcome.NOT_EXECUTED
+                elif transport == "unknown": outcome = MutationOutcome.EXECUTED_AMBIGUOUS
+                elif transition.get("outcome") in {"success", "progress"}: outcome = MutationOutcome.EXECUTED_CONFIRMED
+                else: outcome = MutationOutcome.EXECUTED_NO_EFFECT
+                entry = self.mutation_journal.resolve_action(self._pending_mutation, outcome)
+                self.trace.write(event="mutation_resolved", step=step, mutation_id=entry.id,
+                                 mutation_outcome=outcome, snapshot_id=state.raw_snapshot_id)
+                self._pending_mutation = None
+            metrics["semantic_groups_visited"] = len(agent_context.visited_groups)
             if agent_context.recent_transitions:
-                outcome = agent_context.recent_transitions[-1]["outcome"]
-                jev_steps_without_progress = 0 if outcome in {"progress", "success"} else jev_steps_without_progress + 1
+                transition = agent_context.recent_transitions[-1]
+                sequence = int(transition.get("sequence", 0))
+                if sequence > last_counted_transition:
+                    outcome = transition["outcome"]
+                    jev_steps_without_progress = 0 if outcome in {"progress", "success"} else jev_steps_without_progress + 1
+                    if outcome in {"progress", "success"}:
+                        metrics["verified_mutations_total"] += 1
+                    last_counted_transition = sequence
             compact_context = agent_context.compact()
             state = state.model_copy(update={
                 "recent_context": agent_context.recent_transitions[-12:],
@@ -72,14 +99,15 @@ class MobileController:
             self.trace.write(event="state", step=step, readiness=stabilized.readiness,
                              stabilize_ms=round(stabilized.elapsed_ms, 1), state=state.model_dump(mode="json"))
             self._emit("state_ready", step=step, state=state, stabilize_ms=stabilized.elapsed_ms)
-            if step == 1:
+            if step == 1 and not supplied_task_spec:
                 try:
                     interpretation = await self._interpret_task(goal, state)
                 except ProviderUnavailable:
                     interpretation = None
-                if interpretation is not None and interpretation.task_spec.fields:
-                    task_spec = interpretation.task_spec
-                    agent_context.task_spec = task_spec
+                if interpretation is not None:
+                    task_spec = interpretation.to_task_spec()
+                    agent_context.set_task_spec(task_spec)
+                    agent_context.observe(state)
                     self.trace.write(
                         event="task_interpretation", step=step,
                         content_type=interpretation.content_type, title=interpretation.title,
@@ -90,32 +118,37 @@ class MobileController:
                 except ProviderUnavailable as error:
                     return await self._escalate(goal, str(error), state, [], recent)
                 if plan:
-                    agent_context.task_spec = self._task_spec(goal)
+                    # A plan may add semantic requirements, but it must not
+                    # discard the already resolved Jev task interpretation.
+                    agent_context.set_task_spec(plan.task_spec or task_spec)
+                    agent_context.observe(state)
                     self.trace.write(event="task_plan", step=step, summary=plan.summary,
                                      plan_steps=len(plan.steps), completion_criteria=plan.completion_criteria)
                     self._emit("task_plan", plan=plan)
             if pending_persistence_check:
-                if await self._completion_verified(goal, state, "verified_persistence"):
+                persisted = any(
+                    key.startswith("persisted") and value.value == "satisfied"
+                    for key, value in agent_context.requirement_states.items()
+                )
+                if persisted or await self._completion_verified(goal, state, "verified_persistence"):
                     return RunResult(ControllerStatus.COMPLETED, self.trace.task_id, "Task completed")
                 pending_persistence_check = False
             if stabilized.readiness != UiReadiness.READY and not state.dialog:
-                retry_key = (state.fingerprint, last_action.id) if last_action else None
-                can_retry = (
-                    stabilized.readiness == UiReadiness.UNCHANGED and last_action is not None
-                    and last_action.kind in {ActionKind.TAP, ActionKind.TYPE_TEXT}
-                    and f"{last_action.kind}:{last_action.target_element_id or last_action.label}" not in agent_context.failed_paths
-                    and retry_key is not None and retry_counts.get(retry_key, 0) < self.settings.max_action_retries
-                )
-                if can_retry:
-                    retry_counts[retry_key] = retry_counts.get(retry_key, 0) + 1
-                    self.trace.write(event="action_retry", step=step, action_id=last_action.id,
-                                     attempt=retry_counts[retry_key])
-                    self._emit("retry", action=last_action, attempt=retry_counts[retry_key])
-                    await self._execute(last_action)
-                    continue
-                return await self._escalate(goal, f"{stabilized.readiness.value}_after_action", state, [], recent)
-            if guard.observe(state.fingerprint):
+                # A stable unchanged screen is evidence to re-decide, never
+                # permission to replay a potentially applied mutation.
+                if last_action and last_action.kind in {ActionKind.TAP, ActionKind.TYPE_TEXT}:
+                    self.trace.write(event="mutation_no_blind_retry", step=step, action_id=last_action.id)
+                    # The observation resolved the previous mutation as no
+                    # visible effect. Keep the screen and re-decide with its
+                    # failed-path memory instead of replaying or terminating.
+                else:
+                    return await self._escalate(goal, f"{stabilized.readiness.value}_after_action", state, [], recent)
+            if last_action is not None and guard.observe(state.fingerprint):
                 return await self._escalate(goal, stabilized.readiness.value, state, [], recent)
+            # The just-observed action has been semantically resolved. Local
+            # group/page choices must not count it again as a repeated device
+            # mutation on later outer-loop iterations.
+            last_action = None
             if jev_steps_without_progress >= self.settings.max_jev_steps_without_progress:
                 if navigator.explore_next_branch(
                     state,
@@ -148,9 +181,6 @@ class MobileController:
                         can_complete = True
             page_index = 0
             goal_for_step = self._contextual_goal(goal, state)
-            provider_task_spec = self._task_spec(goal)
-            if provider_task_spec.fields:
-                agent_context.task_spec = provider_task_spec
             task_spec = agent_context.task_spec
             plan_refreshed = False
             while True:
@@ -172,6 +202,8 @@ class MobileController:
                 except ProviderUnavailable as error:
                     return await self._escalate(goal, str(error), state, actions, recent)
                 decision_ms = (time.monotonic() - decision_started) * 1000
+                if self.provider.name.startswith("jev"):
+                    metrics["jev_calls_total"] += 1
                 selected = next((item for item in actions if item.id == decision.action_id), None)
                 margin = probability_margin(decision.probabilities or {})
                 question_type = "semantic_group" if agent_context.navigation_mode == "screen" and page.total_device_actions > 12 else "action"
@@ -200,7 +232,22 @@ class MobileController:
                     and len([action for action in actions if action.goal_directed]) == 1
                     and decision.confidence >= self.settings.single_safe_action_confidence_threshold
                 )
-                if (selected is None or (decision.confidence < self.settings.confidence_threshold and not safe_single_target)
+                deterministic_writes = [
+                    action for action in actions
+                    if action.kind == ActionKind.TYPE_TEXT and action.goal_directed and action.text
+                ]
+                # A known literal mapped to one strongly-described editable
+                # field is a controller operation, not generated language or
+                # an arbitrary device command. Do not waste the zero-LLM path
+                # when Jev merely declines an otherwise unambiguous write.
+                deterministic_selected = len(deterministic_writes) == 1 and (
+                    selected is None or selected.kind == ActionKind.ESCALATE
+                    or decision.confidence < self.settings.confidence_threshold
+                )
+                if deterministic_selected:
+                    selected = deterministic_writes[0]
+                    self.trace.write(event="deterministic_requirement_action", step=step, action_id=selected.id)
+                if (selected is None or (decision.confidence < self.settings.confidence_threshold and not safe_single_target and not deterministic_selected)
                         or (margin is not None and margin < self.settings.minimum_probability_margin)):
                     if navigator.explore_next_branch(
                         state,
@@ -214,7 +261,7 @@ class MobileController:
                         state = state.model_copy(update={"agent_context": agent_context.compact()})
                         continue
                     if await self._recover_after_exploration(goal, state, "low_confidence_or_margin"):
-                        agent_context.task_spec = self._task_spec(goal)
+                        agent_context.set_task_spec(self._task_spec(goal))
                         task_spec = agent_context.task_spec
                         state = state.model_copy(update={"agent_context": agent_context.compact()})
                         continue
@@ -238,9 +285,13 @@ class MobileController:
                     max_safe_exploration_branches=self.settings.max_safe_exploration_branches,
                 ):
                     state = state.model_copy(update={"agent_context": agent_context.compact()})
+                    # This is a controller-local navigation transition, not a
+                    # phone mutation. A fresh readiness cycle must not treat
+                    # the unchanged screen as a failed action.
+                    previous = None
                     continue
                 if await self._recover_after_exploration(goal, state, "provider_requested"):
-                    agent_context.task_spec = self._task_spec(goal)
+                    agent_context.set_task_spec(self._task_spec(goal))
                     task_spec = agent_context.task_spec
                     state = state.model_copy(update={"agent_context": agent_context.compact()})
                     continue
@@ -250,13 +301,46 @@ class MobileController:
                 return RunResult(ControllerStatus.COMPLETED, self.trace.task_id, "Task completed")
             if selected.risk in {ActionRisk.EXTERNAL_EFFECT, ActionRisk.SENSITIVE}:
                 return await self._escalate(goal, "action_requires_approval", state, actions, recent)
+            if not self._target_is_fresh(selected, state):
+                key = f"{selected.kind}:{selected.target_element_id or selected.label}"
+                if key not in agent_context.failed_paths:
+                    agent_context.failed_paths.append(key)
+                self.trace.write(event="stale_decision_discarded", step=step, action_id=selected.id)
+                metrics["stale_decisions_discarded"] += 1
+                last_action = None
+                continue
             if guard.action(state.fingerprint, selected.id):
                 return await self._escalate(goal, "action_loop", state, actions, recent)
-            await self._execute(selected)
+            agent_context.begin_action(selected, state)
+            # The durable intent exists before the adapter receives any mutation.
+            entry = self.mutation_journal.begin_action(action=selected.kind.value,
+                snapshot_id=state.raw_snapshot_id or state.fingerprint, intended_effect=selected.label)
+            metrics["device_mutations_total"] += 1
+            try:
+                receipt = await self._execute(selected)
+                agent_context.mark_transport_outcome(getattr(receipt, "status", "executed"))
+                entry.transport = getattr(receipt, "status", "executed")
+            except MutationOutcomeUnknown:
+                # The action may have happened. The next observation resolves
+                # the intent; it must never be replayed automatically.
+                agent_context.mark_transport_outcome("unknown")
+                entry.transport = "unknown"
+                self.trace.write(event="mutation_outcome_unknown", step=step, action_id=selected.id)
+                metrics["ambiguous_mutations_total"] += 1
+            except MutationRejected as error:
+                agent_context.mark_transport_outcome("rejected")
+                entry.transport = "rejected"
+                self.trace.write(event="mutation_rejected", step=step, action_id=selected.id, reason=str(error))
+            except Exception:
+                # Non-bridge adapters preserve their legacy errors. Record
+                # intent first and let observation determine any side effect.
+                agent_context.mark_transport_outcome("unknown")
+                entry.transport = "unknown"
+                self.trace.write(event="mutation_outcome_unknown", step=step, action_id=selected.id)
             self._emit("action", action=selected)
             recent.append(selected.label)
-            agent_context.record_action(selected, state)
             last_action = selected
+            self._pending_mutation = entry
             # Verified-return completion is currently implemented only for the
             # bounded Settings-navigation MVP. A generic match such as
             # "Open Keep Notes" must never complete a goal that still asks us
@@ -277,6 +361,8 @@ class MobileController:
             ):
                 pending_persistence_check = True
             self.trace.write(event="action", step=step, action=selected.model_dump(mode="json"))
+            self.trace.write(event="metrics", step=step, **metrics,
+                             jev_calls_since_progress=jev_steps_without_progress)
             if selected.kind == ActionKind.WAIT:
                 previous = None
         return await self._escalate(goal, "step_limit", None, [], recent)
@@ -343,14 +429,44 @@ class MobileController:
             self._emit("completed")
         return result.complete
 
-    async def _execute(self, action: CandidateAction) -> None:
-        if action.kind == ActionKind.TAP: await self.device.tap(action.target_element_id or "")
+    async def _execute(self, action: CandidateAction):
+        if action.kind == ActionKind.TAP: return await self.device.tap(action.target_element_id or "")
         elif action.kind == ActionKind.LONG_PRESS: await self.device.long_press(action.target_element_id or "")
-        elif action.kind == ActionKind.TYPE_TEXT: await self.device.type_text(action.text or "", action.target_element_id)
+        elif action.kind == ActionKind.TYPE_TEXT:
+            if self.settings.text_input_strategy == "ime":
+                ime_input = getattr(self.device, "type_text_ime", None)
+                if callable(ime_input):
+                    return await ime_input(action.text or "")
+            return await self.device.type_text(action.text or "", action.target_element_id)
         elif action.kind == ActionKind.SCROLL_DOWN: await self.device.swipe("down")
         elif action.kind == ActionKind.SCROLL_UP: await self.device.swipe("up")
         elif action.kind == ActionKind.BACK: await self.device.back()
         elif action.kind == ActionKind.LAUNCH_APP: await self.device.launch_app(action.package or "")
+
+    @staticmethod
+    def _target_is_fresh(action: CandidateAction, state) -> bool:
+        """Reject a decision if its weak tree path no longer denotes the same control."""
+        descriptor = action.target_descriptor
+        if not descriptor or not action.target_element_id:
+            return True
+        candidates = [element for element in state.elements if element.visible and element.enabled]
+        matches = [element for element in candidates if element.id == action.target_element_id]
+        if len(matches) != 1:
+            return False
+        element = matches[0]
+        for key, actual in {
+            "window_id": element.window_id,
+            "resource_id": element.resource_id,
+            "role": element.role,
+            "field_role": element.field_role,
+        }.items():
+            expected = descriptor.get(key)
+            if expected is not None and expected != actual:
+                return False
+        expected_name = descriptor.get("accessible_name")
+        if expected_name and expected_name not in {element.label, element.accessible_label}:
+            return False
+        return True
 
     async def _escalate(self, goal: str, reason: str, state, actions, recent: list[str]) -> RunResult:
         if state is None:

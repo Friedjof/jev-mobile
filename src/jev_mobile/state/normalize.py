@@ -100,8 +100,17 @@ def _dialog(elements: list[SemanticElement]) -> DialogInfo | None:
 def normalize(raw: RawDeviceState) -> SemanticState:
     elements: list[SemanticElement] = []
     loading = False
+    child_labels = {
+        item.node_id: _clean(item.text) or _clean(item.content_description)
+        for item in raw.elements if item.node_id
+    }
     for index, item in enumerate(raw.elements):
         value, accessible_label = _clean(item.text), _clean(item.content_description)
+        # Many Android menu rows expose CLICK on an unlabelled container and
+        # the human-readable title as a direct TextView child. Promote that
+        # direct semantic label without inventing a coordinate-based target.
+        if not (value or accessible_label) and item.clickable:
+            accessible_label = next((child_labels.get(child_id) for child_id in item.child_ids if child_labels.get(child_id)), None)
         label, role = value or accessible_label, _role(item)
         field_name, field_role = _field_metadata(item, accessible_label) if role == "text_field" else (None, None)
         if role == "progressbar" or (label and label.casefold() in {"loading", "laden", "please wait"}): loading = True
@@ -115,6 +124,21 @@ def normalize(raw: RawDeviceState) -> SemanticState:
             hint=_clean(item.hint), state_description=_clean(item.state_description),
             available_actions=item.available_actions, window_id=item.window_id, parent_id=item.parent_id,
             child_ids=item.child_ids, depth=item.depth, raw_index=index))
+    # A repeated editable sibling of a checkable control is a semantic list
+    # item, regardless of app/resource-id naming. Give each one a stable,
+    # readable ordinal so System One does not see indistinguishable choices.
+    checkable_parents = {item.parent_id for item in raw.elements if item.checkable and item.parent_id}
+    list_item_index = 0
+    indexed: list[SemanticElement] = []
+    for element in elements:
+        if element.editable and element.parent_id in checkable_parents:
+            list_item_index += 1
+            indexed.append(element.model_copy(update={
+                "field_role": "list_item", "field_name": f"List item {list_item_index}",
+            }))
+        else:
+            indexed.append(element)
+    elements = indexed
     state = SemanticState(app=raw.package, screen_hint=raw.activity, elements=elements, fingerprint="",
                           loading=loading, dialog=_dialog(elements), truncated=raw.truncated, raw_snapshot_id=raw.snapshot_id,
                           keyboard_visible=raw.keyboard_visible,
