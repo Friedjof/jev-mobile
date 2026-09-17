@@ -13,3 +13,5 @@ dependencyResolutionManagement {
 
 rootProject.name = "jev-mobile-bridge"
 include(":app")
+include(":test-app")
+project(":test-app").projectDir = file("../jev-mobile-test-app")

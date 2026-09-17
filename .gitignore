@@ -9,3 +9,7 @@ traces/*.escalation.png
 android/jev-mobile-bridge/local.properties
 android/jev-mobile-bridge/.gradle/
 android/jev-mobile-bridge/app/build/
+android/jev-mobile-test-app/build/
+jev-mobile-tasks.sqlite3
+jev-mobile-tasks.sqlite3-shm
+jev-mobile-tasks.sqlite3-wal
