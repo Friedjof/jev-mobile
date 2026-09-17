@@ -1,0 +1,54 @@
+services:
+  worker:
+    build:
+      context: .
+      args:
+        JEV_UID: ${JEV_MOBILE_UID:-1000}
+        JEV_GID: ${JEV_MOBILE_GID:-1000}
+    image: jev-mobile:local
+    command: ["worker", "--backend", "portal-adb"]
+    restart: unless-stopped
+    init: true
+    env_file:
+      - ${JEV_MOBILE_ENV_FILE:?Set JEV_MOBILE_ENV_FILE to an external env file}
+    environment:
+      JEV_MOBILE_DB: /data/jev-mobile.db
+      TRACE_DIR: /data/traces
+      HOME: /home/jev
+    volumes:
+      - ${JEV_MOBILE_DATA_DIR:?Set JEV_MOBILE_DATA_DIR to a local host directory}:/data:rw
+      - ${JEV_MOBILE_ADB_KEYS_DIR:?Set JEV_MOBILE_ADB_KEYS_DIR to the host ADB key directory}:/home/jev/.android:rw
+      - /dev/bus/usb:/dev/bus/usb:rw
+    device_cgroup_rules:
+      - "c 189:* rmw"
+    group_add:
+      - "${JEV_MOBILE_USB_GID:-46}"
+    healthcheck:
+      test: ["CMD-SHELL", "jev-mobile doctor --backend portal-adb --serial \"$${MOBILE_DEVICE_SERIAL}\""]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 20s
+
+  mcp:
+    image: jev-mobile:local
+    build:
+      context: .
+      args:
+        JEV_UID: ${JEV_MOBILE_UID:-1000}
+        JEV_GID: ${JEV_MOBILE_GID:-1000}
+    entrypoint: ["jev-mobile-mcp"]
+    command: []
+    stdin_open: true
+    tty: false
+    init: true
+    env_file:
+      - ${JEV_MOBILE_ENV_FILE:?Set JEV_MOBILE_ENV_FILE to an external env file}
+    environment:
+      JEV_MOBILE_DB: /data/jev-mobile.db
+      HOME: /home/jev
+    volumes:
+      - ${JEV_MOBILE_DATA_DIR:?Set JEV_MOBILE_DATA_DIR to a local host directory}:/data:rw
+    # Intentionally no USB mount, device cgroup rule, ADB key mount, network
+    # port or Docker socket. MCP communicates over stdio only.
+    network_mode: none

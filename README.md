@@ -83,8 +83,7 @@ The live CLI shows the current stable UI, candidate actions, Jev confidence and 
 - Human-friendly `devices`, `inspect`, `decide`, and `run` CLI output
 - An in-repository Android Accessibility Bridge PoC with real node actions and
   USB-only ADB forwarding (manual service enablement required)
-- A stdio MCP server exposing bounded `mobile_agent_inspect`,
-  `mobile_agent_decide`, and `mobile_agent_run` operations
+- A durable SQLite-backed worker and a stdio MCP delegation surface
 
 ### Deliberately not solved yet
 
@@ -173,6 +172,13 @@ uv run jev-mobile decide \
 ```
 
 See the bridge's [development and security notes](android/jev-mobile-bridge/README.md).
+
+For apps that render `ACTION_SET_TEXT` but do not persist it, the companion
+also includes an opt-in Unicode input method. Enable and select **Jev Mobile
+Input** manually in Android keyboard settings, then set
+`TEXT_INPUT_STRATEGY=ime`. It commits text through Android's `InputConnection`
+and supports characters such as `ä`, `ö`, `ü`, `ß`, and punctuation. The
+controller never changes the device's default keyboard automatically.
 
 > On Android 11, Mobile Next's DeviceServer starts `UiAutomation`, which
 > suppresses third-party Accessibility Services unless it opts out with
@@ -282,21 +288,61 @@ production build.
 
 ## MCP integration
 
-`jev-mobile-mcp` is a small stdio MCP server for higher-level orchestrators
-such as OpenClaw. It currently exposes inspection, dry-run decision, and the
-bounded controller run:
+`jev-mobile-mcp` is a stdio MCP server for higher-level orchestrators such as
+OpenClaw. It delegates a durable task to the local worker; it does not expose
+Android controls:
 
 ```text
-mobile_agent_run(goal)
-mobile_agent_inspect()
-mobile_agent_decide(goal)
-mobile_agent_run(goal)
+start_task(instruction)
+get_task(task_id)
+get_task_events(task_id, after_seq)
+cancel_task(task_id)
+answer_task(task_id, question_id, answer)
+get_device_status()
 ```
 
-Status, resume, and stop tools will follow with durable task storage. The
-existing split remains intentional: an orchestrator starts a goal, the local
-Jev loop handles fast structured navigation, and a stronger model is called
-only for ambiguity, vision, language generation, or sensitive decisions.
+Configure an MCP client to launch `jev-mobile-mcp` with the same
+`JEV_MOBILE_DB` as the worker. The server is intentionally stdio-based: an
+OpenClaw client owns its connection, while the worker continues independently
+if that client disconnects or restarts. No public tool performs tap, swipe,
+type, or raw accessibility operations.
+
+## Docker deployment
+
+Docker is an alternative deployment backend; the native systemd worker remains
+supported. The worker is the only container with USB/ADB access. The MCP
+container is stdio-only and reads the shared SQLite task store without an ADB
+key, USB mount, published port, Docker socket, or device cgroup permission.
+
+Create a secret-bearing runtime environment file outside the repository from
+[`deploy/docker/jev-mobile.env.example`](deploy/docker/jev-mobile.env.example),
+then export these host-specific paths before starting Compose:
+
+```bash
+export JEV_MOBILE_ENV_FILE="$HOME/.config/jev-mobile/docker.env"
+export JEV_MOBILE_DATA_DIR="$HOME/.local/share/jev-mobile"
+export JEV_MOBILE_ADB_KEYS_DIR="$HOME/.android"
+export JEV_MOBILE_UID="$(id -u)"
+export JEV_MOBILE_GID="$(id -g)"
+export JEV_MOBILE_USB_GID="$(getent group plugdev | cut -d: -f3)"
+docker compose up -d worker
+```
+
+`JEV_MOBILE_DATA_DIR` must be a local filesystem because SQLite WAL is not
+safe on NFS or SMB. The worker healthcheck runs `jev-mobile doctor`; an
+unplugged device makes it unhealthy but does not by itself restart the worker.
+No service exposes ADB over TCP.
+
+For an MCP parent that launches stdio servers, use the same external env file
+and data directory, for example:
+
+```bash
+docker compose run --rm -T mcp
+```
+
+The parent owns this stdio process while the worker continues independently.
+OpenClaw-specific command configuration is intentionally deferred until its
+actual deployment (host process versus container) is known.
 
 ## License
 
