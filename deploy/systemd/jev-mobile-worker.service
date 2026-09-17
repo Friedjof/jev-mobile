@@ -1,0 +1,15 @@
+[Unit]
+Description=Jev Mobile durable Android worker
+After=default.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/jev-mobile/worker.env
+ExecStart=%h/.local/bin/jev-mobile worker --backend ${JEV_MOBILE_BACKEND} --serial ${JEV_MOBILE_DEVICE}
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

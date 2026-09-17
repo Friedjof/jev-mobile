@@ -11,6 +11,7 @@ from .config import Settings
 from .controller.loop import MobileController
 from .device.mobile_mcp import MobileMcpAdapter, MobileMcpError
 from .device.accessibility_adb import AccessibilityAdbAdapter
+from .device.portal_adb import PortalAdbDeviceAdapter
 from .providers.heuristic import HeuristicProvider
 from .providers.jev import JevProvider
 from .providers.llm import LLMProvider
@@ -22,8 +23,14 @@ from .providers.planned import PlanGuidedProvider
 from .escalation.planner import LLMPlanner
 from .state.normalize import normalize
 from .tracing.trace import TraceWriter
+from .agent.mobile_agent import MobileAgent
+from .runtime.worker import DurableWorker
+from .task_store import TaskStatus, TaskStore
+from .tasks import task_spec_from_goal
 
 app = typer.Typer(no_args_is_help=True)
+task_app = typer.Typer(no_args_is_help=True)
+app.add_typer(task_app, name="task")
 
 
 def _provider(name: str, settings: Settings):
@@ -44,7 +51,108 @@ def _device(backend: str, settings: Settings, serial: str | None):
         if not selected_serial:
             raise typer.BadParameter("--serial (or MOBILE_DEVICE_SERIAL) is required for --backend bridge")
         return AccessibilityAdbAdapter(selected_serial, port=settings.bridge_port, bridge_token=settings.bridge_token)
-    raise typer.BadParameter("backend must be mobile-mcp or bridge")
+    if backend == "portal-adb":
+        if not selected_serial:
+            raise typer.BadParameter("--serial (or MOBILE_DEVICE_SERIAL) is required for --backend portal-adb")
+        return PortalAdbDeviceAdapter(selected_serial)
+    raise typer.BadParameter("backend must be mobile-mcp, bridge, or portal-adb")
+
+
+@app.command()
+def doctor(
+    serial: str | None = typer.Option(None),
+    backend: str = typer.Option("portal-adb", "--backend"),
+) -> None:
+    """Diagnose one backend without selecting a fallback transport."""
+    async def command(*args: str) -> tuple[bool, str]:
+        process = await asyncio.create_subprocess_exec("adb", "-s", selected, *args,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout, stderr = await process.communicate()
+        return process.returncode == 0, (stdout or stderr).decode(errors="replace").strip()
+
+    async def diagnose() -> int:
+        settings = Settings.from_env()
+        nonlocal selected
+        selected = serial or settings.device_serial
+        if not selected:
+            typer.echo("ERROR  serial is required", err=True); return 2
+        checks: list[tuple[str, str, str]] = []
+        ok, output = await command("get-state")
+        checks.append(("ADB device", "OK" if ok and output == "device" else "ERROR", output))
+        if backend != "portal-adb":
+            checks.append(("Backend", "WARNING", "only portal-adb has full local diagnostics"))
+        ok, output = await command("shell", "pm", "path", "com.mobilerun.portal")
+        checks.append(("Portal package", "OK" if ok and "package:" in output else "ERROR", output))
+        ok, output = await command("shell", "settings", "get", "secure", "enabled_accessibility_services")
+        checks.append(("Portal accessibility", "OK" if "com.mobilerun.portal.service.MobilerunAccessibilityService" in output else "ERROR", output))
+        ok, output = await command("shell", "ime", "list", "-s")
+        checks.append(("Portal keyboard", "OK" if "com.mobilerun.portal/.input.MobilerunKeyboardIME" in output else "WARNING", output))
+        try:
+            async with _device("portal-adb", settings, selected) as device:
+                raw = await device.observe()
+                image = await device.screenshot()
+            checks.extend([("Portal ContentProvider", "OK", "reachable"),
+                           ("state_full observation", "OK", f"{raw.package} / {len(raw.elements)} nodes"),
+                           ("screenshot", "OK" if image.startswith(b"\x89PNG") else "WARNING", f"{len(image)} bytes")])
+        except Exception as error:
+            checks.append(("Portal runtime", "ERROR", str(error)))
+        for label, status, detail in checks: typer.echo(f"{status:<7} {label}: {detail}")
+        return 0 if not any(status == "ERROR" for _, status, _ in checks) else 2
+
+    selected = ""
+    raise typer.Exit(asyncio.run(diagnose()))
+
+
+@app.command()
+def worker(serial: str | None = typer.Option(None), backend: str = typer.Option("portal-adb"), provider: str = typer.Option("jev")) -> None:
+    """Run the long-lived owner of one physical Android device."""
+    async def serve() -> None:
+        settings = Settings.from_env(); selected = serial or settings.device_serial
+        if not selected: raise typer.BadParameter("--serial (or MOBILE_DEVICE_SERIAL) is required")
+        store = TaskStore()
+        agent = MobileAgent(store, lambda: _device(backend, settings, selected), _provider(provider, settings), settings)
+        await DurableWorker(store, agent, selected).run_forever()
+    asyncio.run(serve())
+
+
+@task_app.command("start")
+def task_start(instruction: str) -> None:
+    task = TaskStore().create(instruction, task_spec_from_goal(instruction))
+    typer.echo(f"{task.id}\t{task.status.value}")
+
+
+@task_app.command("get")
+def task_get(task_id: str) -> None:
+    task = TaskStore().get(task_id)
+    if not task: raise typer.BadParameter("unknown task")
+    typer.echo(task.model_dump_json(indent=2))
+
+
+@task_app.command("events")
+def task_events(task_id: str) -> None:
+    import json
+    typer.echo(json.dumps(TaskStore().events(task_id), indent=2))
+
+
+@task_app.command("report")
+def task_report(task_id: str) -> None:
+    """Render persisted task/events; it never talks to the Android device."""
+    store = TaskStore(); task = store.get(task_id)
+    if not task: raise typer.BadParameter("unknown task")
+    typer.echo(f"Task {task.id}: {task.status.value}\nSubgoal: {task.current_subgoal or '-'}\nSteps: {task.step_number}")
+    for event in store.events(task_id):
+        payload = event["payload"]
+        typer.echo(f"\n#{event['seq']} {event['event_type']} {payload}")
+    if task.result: typer.echo(f"\nResult:\n{task.result}")
+
+
+@task_app.command("cancel")
+def task_cancel(task_id: str) -> None:
+    store = TaskStore(); task = store.get(task_id)
+    if not task: raise typer.BadParameter("unknown task")
+    if task.status not in {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELLED}:
+        task.cancellation_requested = True; store.save(task); store.event(task_id, "TASK_CANCELLATION_REQUESTED", {})
+    typer.echo(f"{task_id}\tcancellation_requested")
 
 
 @app.command()
