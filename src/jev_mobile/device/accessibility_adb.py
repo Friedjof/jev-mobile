@@ -30,7 +30,11 @@ class AccessibilityAdbAdapter:
 
     async def __aenter__(self) -> "AccessibilityAdbAdapter":
         await self._adb("forward", f"tcp:{self.port}", f"tcp:{self.port}")
-        self.client = httpx.AsyncClient(base_url=self.base_url, timeout=5)
+        # ACTION_SET_TEXT can synchronously wait for an Android accessibility
+        # transaction on OEM builds. It may succeed after the former 5 s
+        # client timeout, so keep the transport patient while the controller
+        # still bounds total task runtime separately.
+        self.client = httpx.AsyncClient(base_url=self.base_url, timeout=15)
         try:
             response = await self.client.get("/health")
             response.raise_for_status()
@@ -96,8 +100,17 @@ class AccessibilityAdbAdapter:
     async def type_text(self, text: str, target: str | None = None) -> None:
         if not target:
             raise MobileMcpError("Accessibility text entry requires a verified editable target")
-        await self._action("focus", target)
-        await self._action("set_text", target, text=text)
+        # ACTION_SET_TEXT is valid on an already-focused field. Focusing first
+        # is actively harmful on several Android widgets because ACTION_FOCUS
+        # then returns false and prevents the write from being attempted.
+        try:
+            await self._action("set_text", target, text=text)
+        except MobileMcpError as initial_error:
+            try:
+                await self._action("focus", target)
+                await self._action("set_text", target, text=text)
+            except MobileMcpError:
+                raise initial_error
 
     async def swipe(self, direction: str) -> None:
         if not self._scroll_target:

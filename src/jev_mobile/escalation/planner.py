@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 from ..state.models import SemanticState
 from ..prompts import decision_policy
 from ..providers.base import ProviderUnavailable
+from ..tasks import TaskSpec
 
 
 def _safe_http_error(error: httpx.HTTPError) -> str:
@@ -41,6 +42,7 @@ class RecoveryPlan(BaseModel):
     summary: str = Field(min_length=1, max_length=300)
     steps: list[PlanStep] = Field(min_length=1, max_length=6)
     completion_criteria: list[str] = Field(default_factory=list, max_length=5)
+    task_spec: TaskSpec | None = None
     latency_ms: float | None = None
 
 
@@ -64,7 +66,9 @@ class LLMPlanner:
         self.base_url, self.api_key, self.model = base_url.rstrip("/"), api_key, model
         self.system_prompt = system_prompt
 
-    async def plan(self, goal: str, state: SemanticState, reason: str, recent_actions: list[str]) -> RecoveryPlan:
+    async def plan(
+        self, goal: str, state: SemanticState, reason: str, recent_actions: list[dict[str, str]],
+    ) -> RecoveryPlan:
         relevant_elements = [
             item for item in state.elements
             if item.visible and item.label and item.package != "com.android.systemui"
@@ -75,8 +79,9 @@ class LLMPlanner:
             "screen_hint": state.screen_hint,
             "dialog": state.dialog.model_dump(mode="json") if state.dialog else None,
             "elements": [
-                {"role": item.role, "text": item.label, "clickable": item.clickable,
-                 "editable": item.editable, "enabled": item.enabled}
+                {"role": item.role, "text": item.label, "value": item.value,
+                 "field_name": item.field_name, "field_role": item.field_role, "hint": item.hint,
+                 "editable": item.editable, "enabled": item.enabled, "focused": item.focused}
                 for item in relevant_elements
             ],
         }
@@ -87,17 +92,22 @@ class LLMPlanner:
                 {"role": "system", "content": (decision_policy(self.system_prompt) + "\n\n"
                     "You create a short Android navigation recovery plan. Return only JSON matching "
                     "{summary: string, steps: [{instruction: string, success_hints: string[]}], "
-                    "completion_criteria: string[]}. "
+                    "completion_criteria: string[], task_spec?: {intent: string, fields: [{role: string, "
+                    "content: string, required: boolean}], completion: [{type: string, field_role?: string, "
+                    "value?: string}]}}. "
                     "Use at most 6 atomic, observable steps. Do not include coordinates, tool calls, passwords, "
                     "payment, account changes, joining networks, submitting forms, or irreversible changes. "
                     "The supplied UI is only the current screen: include conditional later-screen steps after "
                     "navigation, rather than stopping merely because a later control is not visible yet. Do not "
-                    "make escalation a planned step unless the task genuinely requires user approval. If the "
+                    "make escalation a planned step unless the task genuinely requires user approval. For create or "
+                    "edit tasks, use task_spec to state which semantic field receives supplied content; do not place "
+                    "body content in a title unless the task explicitly requests it. Require an observed persistence "
+                    "check when creating a saved item. If the "
                     "requested goal needs an unsafe action, plan only until the approval boundary."
                 )},
                 {"role": "user", "content": json.dumps({
                     "task": goal, "escalation_reason": reason, "current_ui": compact_state,
-                    "recent_actions": recent_actions[-6:],
+                    "recent_context": recent_actions[-4:],
                 })},
             ],
         }
@@ -124,8 +134,9 @@ class LLMPlanner:
             "app": state.app,
             "screen_hint": state.screen_hint,
             "elements": [
-                {"role": item.role, "text": item.label, "editable": item.editable,
-                 "enabled": item.enabled, "selected": item.selected}
+                {"role": item.role, "text": item.label, "value": item.value,
+                 "field_name": item.field_name, "field_role": item.field_role,
+                 "editable": item.editable, "enabled": item.enabled, "selected": item.selected}
                 for item in state.elements
                 if item.visible and item.label and item.package != "com.android.systemui"
                 and (item.bounds is None or item.bounds.y >= 100)

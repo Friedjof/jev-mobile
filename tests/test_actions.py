@@ -1,6 +1,8 @@
-from jev_mobile.actions.builder import build_action_page, build_candidates, known_note_text_present
+from jev_mobile.actions.builder import build_action_page, build_candidates, expected_fields_present
 from jev_mobile.actions.models import ActionKind, ActionRisk
-from jev_mobile.state.models import SemanticElement, SemanticState
+from jev_mobile.state.models import Bounds, RawDeviceElement, RawDeviceState, SemanticElement, SemanticState
+from jev_mobile.state.normalize import normalize
+from jev_mobile.tasks import FieldRequirement, TaskSpec
 
 
 def state() -> SemanticState:
@@ -89,10 +91,56 @@ def test_explicit_note_text_becomes_reversible_text_input() -> None:
     assert actions[0].text == "Eggs, bread"
 
 
-def test_known_note_text_is_verified_only_when_visible_in_keep() -> None:
-    saved = state().model_copy(update={"app": "com.google.android.keep", "elements": [
-        SemanticElement(id="e1", role="text_field", label="Eggs, bread", clickable=True, editable=True,
-                        enabled=True, selected=False, visible=True, scrollable=False, depth=0, raw_index=0),
+def test_note_body_requirement_never_accepts_text_in_title() -> None:
+    goal = "create a new note for shopping: Eier, Brot, Fisch, Frischkäse, Salat, Essig"
+    expected = "Eier, Brot, Fisch, Frischkäse, Salat, Essig"
+    editor = normalize(RawDeviceState(elements=[
+        RawDeviceElement(
+            node_id="e56", text=expected, editable=True, focused=False,
+            resource_id="com.google.android.keep:id/editable_title", class_name="android.widget.EditText",
+            bounds=Bounds(x=0, y=0, width=100, height=20),
+        ),
+        RawDeviceElement(
+            node_id="e57", editable=True, focused=True,
+            resource_id="com.google.android.keep:id/edit_note_text", class_name="android.widget.EditText",
+            bounds=Bounds(x=0, y=30, width=100, height=80),
+        ),
+    ]))
+    actions = build_candidates(editor, goal)
+    body_action = next(action for action in actions if action.kind == ActionKind.TYPE_TEXT)
+
+    assert body_action.target_element_id == "e57"
+    assert '"Note body"' in body_action.label
+    assert editor.focused_element_id == "e57"
+    assert not expected_fields_present(editor, TaskSpec(fields=[FieldRequirement(role="body", content=expected)]))
+
+
+def test_generic_multiple_text_fields_are_not_selected_by_tree_order() -> None:
+    editor = state().model_copy(update={"elements": [
+        SemanticElement(id="first", role="text_field", field_name="First field", field_role="text",
+                        clickable=True, editable=True, enabled=True, selected=False, visible=True,
+                        scrollable=False, depth=0, raw_index=0),
+        SemanticElement(id="second", role="text_field", field_name="Second field", field_role="text",
+                        clickable=True, editable=True, enabled=True, selected=False, visible=True,
+                        scrollable=False, depth=0, raw_index=1),
     ]})
-    assert known_note_text_present(saved, "Create a new note for shopping: Eggs, bread")
-    assert not known_note_text_present(saved, "Create a new note for shopping: Eggs, milk")
+    spec = TaskSpec(fields=[FieldRequirement(role="text", content="hello")])
+    actions = build_candidates(editor, "Fill the form", task_spec=spec)
+    text_actions = [action for action in actions if action.kind == ActionKind.TYPE_TEXT]
+
+    assert {action.target_element_id for action in text_actions} == {"first", "second"}
+
+
+def test_filled_note_body_requests_persistence_check_instead_of_done() -> None:
+    expected = "Eggs, bread"
+    editor = normalize(RawDeviceState(elements=[
+        RawDeviceElement(node_id="title", editable=True, resource_id="example:id/editable_title",
+                         class_name="android.widget.EditText"),
+        RawDeviceElement(node_id="body", text=expected, editable=True, focused=True,
+                         resource_id="example:id/edit_note_text", class_name="android.widget.EditText"),
+    ]))
+    actions = build_candidates(editor, f"Create a new note: {expected}")
+
+    assert actions[0].kind == ActionKind.BACK
+    assert "persisted" in actions[0].label
+    assert all(action.kind != ActionKind.DONE for action in actions)

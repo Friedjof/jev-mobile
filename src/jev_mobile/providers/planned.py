@@ -5,8 +5,8 @@ from __future__ import annotations
 from ..actions.models import CandidateAction, Decision
 from ..escalation.planner import LLMPlanner, RecoveryPlan, TaskVerification
 from ..state.models import SemanticState
+from ..tasks import TaskSpec, task_spec_from_goal
 from .base import DecisionProvider
-from .jev import probability_margin
 
 
 class PlanGuidedProvider:
@@ -31,11 +31,19 @@ class PlanGuidedProvider:
         self.plan_first = plan_first
         self.verification_instruction: str | None = None
 
+    def task_spec(self, goal: str) -> TaskSpec:
+        """Use LLM intent when available; retain safe local parsing otherwise."""
+        return self.plan.task_spec if self.plan and self.plan.task_spec else task_spec_from_goal(goal)
+
+    async def interpret_task(self, goal: str, state: SemanticState):
+        interpret = getattr(self.provider, "interpret_task", None)
+        return await interpret(goal, state) if callable(interpret) else None
+
     async def ensure_plan(self, goal: str, state: SemanticState) -> RecoveryPlan | None:
         """Create the initial plan once before the fast loop acts."""
         if self.plan or not self.plan_first:
             return None
-        self.plan = await self.planner.plan(goal, state, "initial_task_decomposition", [])
+        self.plan = await self.planner.plan(goal, state, "initial_task_decomposition", state.recent_context)
         self._plan_origin_fingerprint = state.fingerprint
         self.recoveries += 1
         return self.plan
@@ -52,6 +60,15 @@ class PlanGuidedProvider:
     async def verify_completion(self, goal: str, state: SemanticState) -> TaskVerification | None:
         if not self.plan:
             return None
+        task_spec = self.task_spec(goal)
+        if task_spec.intent == "create_note" and any(
+            element.visible and element.editable for element in state.elements
+        ):
+            return TaskVerification(
+                complete=False,
+                reason="Expected note content is still visible only in an editable draft field.",
+                next_instruction="Leave the editor safely, then verify the saved note is visible outside the editor.",
+            )
         result = await self.planner.verify(goal, self.plan, state)
         self.verification_instruction = None if result.complete else result.next_instruction
         return result
@@ -75,26 +92,15 @@ class PlanGuidedProvider:
 
     async def decide(self, goal: str, state: SemanticState, actions: list[CandidateAction]) -> Decision:
         contextual_goal = self.contextual_goal(goal, state)
-        decision = await self.provider.decide(contextual_goal, state, actions)
-        margin = probability_margin(decision.probabilities or {})
-        uncertain = (
-            decision.action_id == "ESCALATE"
-            or decision.confidence < self.confidence_threshold
-            or (margin is not None and margin < self.minimum_probability_margin)
-        )
-        if not uncertain or self.recoveries >= self.max_recoveries:
-            return decision
+        return await self.provider.decide(contextual_goal, state, actions)
 
-        self.plan = await self.planner.plan(goal, state, "fast_provider_uncertain", [])
+    async def recover(self, goal: str, state: SemanticState, reason: str) -> RecoveryPlan | None:
+        """Create one System-2 recovery only after controller exploration is exhausted."""
+        if self.recoveries >= self.max_recoveries:
+            return None
+        self.plan = await self.planner.plan(goal, state, reason, state.recent_context)
         self.step_index = 0
         self._last_advanced_fingerprint = None
         self._plan_origin_fingerprint = state.fingerprint
         self.recoveries += 1
-        metadata = dict(decision.reasoning_metadata or {})
-        metadata.update({
-            "recovery_plan_created": True,
-            "plan_summary": self.plan.summary,
-            "plan_steps": len(self.plan.steps),
-            "planner_latency_ms": self.plan.latency_ms,
-        })
-        return decision.model_copy(update={"reasoning_metadata": metadata})
+        return self.plan

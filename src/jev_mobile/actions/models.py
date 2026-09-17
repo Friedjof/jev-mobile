@@ -16,6 +16,10 @@ class ActionKind(StrEnum):
     LAUNCH_APP = "launch_app"
     WAIT = "wait"
     MORE_ACTIONS = "more_actions"
+    SELECT_GROUP = "select_group"
+    NEXT_GROUP = "next_group"
+    PREVIOUS_GROUP = "previous_group"
+    SEARCH_RELEVANT = "search_relevant"
     ESCALATE = "escalate"
     DONE = "done"
 

@@ -233,6 +233,10 @@ The Jev provider uses the official `AsyncTypeSafeClient`. A Choice response is r
 - Low confidence, a small top-two probability margin, repeated states, loops, timeouts, and step limits stop automation.
 - `EXTERNAL_EFFECT` and `SENSITIVE` action classes are not autonomously executed.
 - API keys and authorization headers are never written to traces.
+- Jev is the default exploration engine: wide screens are searched through
+  semantic groups and bounded group pages before a System-2 recovery is asked.
+- Every Jev request receives compact controller-owned task progress, navigation
+  state, failed/successful semantic paths, and up to 12 recent transitions.
 
 ## Development
 

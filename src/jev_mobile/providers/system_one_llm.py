@@ -29,7 +29,7 @@ class SystemOneLLMProvider:
     async def decide(self, goal: str, state: SemanticState, actions: list[CandidateAction]) -> Decision:
         if not self._api_key or not self._model:
             raise ProviderUnavailable("LLM_API_KEY and LLM_MODEL are required for system-one-llm")
-        compact_state = build_jev_state(goal, state)
+        compact_state = build_jev_state(goal, state, actions)
         criteria = {action.id: action.label for action in actions}
         provider = AsyncOpenAIProvider(self._model, base_url=self._base_url, api_key=self._api_key)
         started = time.perf_counter()

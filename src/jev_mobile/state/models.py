@@ -78,6 +78,10 @@ class SemanticElement(BaseModel):
     id: str
     role: str
     label: str | None = None
+    value: str | None = None
+    accessible_label: str | None = None
+    field_name: str | None = None
+    field_role: str | None = None
     resource_id: str | None = None
     package: str | None = None
     bounds: Bounds | None = None
@@ -115,3 +119,5 @@ class SemanticState(BaseModel):
     keyboard_visible: bool = False
     focused_element_id: str | None = None
     active_window_id: int | None = None
+    recent_context: list[dict[str, Any]] = Field(default_factory=list)
+    agent_context: dict[str, Any] = Field(default_factory=dict)

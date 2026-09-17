@@ -29,6 +29,9 @@ class Settings:
     max_escalations: int = 3
     enable_llm_planning: bool = False
     max_plan_recoveries: int = 1
+    max_jev_steps_without_progress: int = 20
+    max_safe_exploration_branches: int = 5
+    max_group_revisits: int = 2
     llm_base_url: str | None = None
     llm_api_key: str | None = None
     llm_model: str | None = None
@@ -67,6 +70,9 @@ class Settings:
             capture_escalation_screenshots=os.getenv("CAPTURE_ESCALATION_SCREENSHOTS", "true").casefold() in {"1", "true", "yes"},
             enable_llm_planning=os.getenv("ENABLE_LLM_PLANNING", "false").casefold() in {"1", "true", "yes"},
             max_plan_recoveries=max_plan_recoveries,
+            max_jev_steps_without_progress=int(os.getenv("MAX_JEV_STEPS_WITHOUT_PROGRESS", "20")),
+            max_safe_exploration_branches=int(os.getenv("MAX_SAFE_EXPLORATION_BRANCHES", "5")),
+            max_group_revisits=int(os.getenv("MAX_GROUP_REVISITS", "2")),
             llm_base_url=os.getenv("LLM_BASE_URL") or None,
             llm_api_key=os.getenv("LLM_API_KEY") or None,
             llm_model=os.getenv("LLM_MODEL") or None,

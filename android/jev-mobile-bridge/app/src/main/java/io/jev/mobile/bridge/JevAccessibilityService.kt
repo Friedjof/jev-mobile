@@ -153,6 +153,7 @@ class JevAccessibilityService : AccessibilityService() {
         val data = json.toString().toByteArray(StandardCharsets.UTF_8)
         output.write("HTTP/1.1 $status ${if (status == 200) "OK" else "Bad Request"}\r\nContent-Type: application/json\r\nContent-Length: ${data.size}\r\nConnection: close\r\n\r\n".toByteArray())
         output.write(data)
+        output.flush()
     }
 
     private fun buildState(): JSONObject {
@@ -241,7 +242,17 @@ class JevAccessibilityService : AccessibilityService() {
         if (path.isEmpty()) return null
         var current = rootInActiveWindow ?: return null
         for (part in path.split('.').drop(1)) {
-            val child = current.getChild(part.toIntOrNull() ?: return null)
+            val index = part.toIntOrNull() ?: run {
+                current.recycle()
+                return null
+            }
+            // Accessibility trees can change between snapshot and action.
+            // getChild() throws for an out-of-range stale index on Android 11.
+            if (index !in 0 until current.childCount) {
+                current.recycle()
+                return null
+            }
+            val child = current.getChild(index)
             current.recycle()
             current = child ?: return null
         }

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from .models import ActionKind, ActionPage, ActionRisk, CandidateAction
 from ..state.models import SemanticState
+from ..tasks import TaskSpec, task_spec_from_goal
 
 
 def goal_keywords(goal: str) -> tuple[str, ...]:
@@ -30,14 +31,21 @@ def goal_note_text(goal: str) -> str | None:
     return content.strip() if separator and content.strip() else None
 
 
-def known_note_text_present(state: SemanticState, goal: str) -> bool:
-    """Verify a supplied note body from the semantic UI, never from an action."""
-    expected = goal_note_text(goal)
-    if not expected or state.app != "com.google.android.keep":
+def expected_fields_present(state: SemanticState, task_spec: TaskSpec) -> bool:
+    """Check expected content in the intended semantic field, never anywhere on screen."""
+    required = [field for field in task_spec.fields if field.required]
+    if not required:
         return False
-    visible_text = " ".join(element.label or "" for element in state.elements if element.visible)
-    normalize = lambda value: " ".join(value.casefold().split())
-    return normalize(expected) in normalize(visible_text)
+    normalized = lambda value: " ".join(value.casefold().split())
+    for requirement in required:
+        values = [
+            element.value or element.label or ""
+            for element in state.elements
+            if element.visible and element.editable and element.field_role == requirement.role
+        ]
+        if not any(normalized(requirement.content) in normalized(value) for value in values):
+            return False
+    return True
 
 
 def _app_intent_labels(goal: str) -> tuple[str, ...]:
@@ -77,7 +85,9 @@ def _actionable_elements(state: SemanticState):
     return list(unique.values())
 
 
-def _ranked_device_actions(state: SemanticState, goal: str, return_mode: bool) -> list[CandidateAction]:
+def _ranked_device_actions(
+    state: SemanticState, goal: str, return_mode: bool, task_spec: TaskSpec,
+) -> list[CandidateAction]:
     if state.dialog:
         if state.dialog.kind.value != "safe_dismissible":
             # Android Back cancels/dismisses a modal; it never accepts a
@@ -126,12 +136,35 @@ def _ranked_device_actions(state: SemanticState, goal: str, return_mode: bool) -
                 target_element_id=element.id, risk=ActionRisk.REVERSIBLE, goal_directed=True,
             ) for index, element in enumerate(create_note_controls, start=1)]
     editable = [element for element in state.elements if element.visible and element.enabled and element.editable]
-    if editable and note_text:
-        existing_text = " ".join(element.label or "" for element in state.elements).casefold()
-        if note_text.casefold() not in existing_text:
-            return [CandidateAction(id="A1", kind=ActionKind.TYPE_TEXT,
-                                    label="Enter the supplied note text", target_element_id=editable[0].id,
-                                    text=note_text, risk=ActionRisk.REVERSIBLE, goal_directed=True)]
+    if task_spec.intent == "create_note" and expected_fields_present(state, task_spec):
+        return [CandidateAction(
+            id="A1", kind=ActionKind.BACK,
+            label="Leave editor and verify the note is persisted outside the draft",
+            goal_directed=True,
+        )]
+    if editable and task_spec.fields:
+        actions: list[CandidateAction] = []
+        for requirement in task_spec.fields:
+            matching_fields = [field for field in editable if field.field_role == requirement.role]
+            # A generic field requirement deliberately exposes each writable
+            # field. We never select based on accessibility tree order.
+            if not matching_fields and requirement.role == "text":
+                matching_fields = editable
+            if not matching_fields and len(editable) == 1:
+                matching_fields = editable
+            for field in matching_fields:
+                current = field.value or ""
+                if requirement.content.casefold() in current.casefold():
+                    continue
+                focused = " [focused]" if field.focused else ""
+                actions.append(CandidateAction(
+                    id=f"A{len(actions) + 1}", kind=ActionKind.TYPE_TEXT,
+                    label=f'Enter supplied text into "{field.field_name or "Text"}"{focused}',
+                    target_element_id=field.id, text=requirement.content,
+                    risk=ActionRisk.REVERSIBLE, goal_directed=True,
+                ))
+        if actions:
+            return actions
     if editable and goal_search_text(goal):
         return [CandidateAction(id="A1", kind=ActionKind.TYPE_TEXT,
                                 label=f'Type "{goal_search_text(goal)}" into search',
@@ -165,9 +198,10 @@ def _ranked_device_actions(state: SemanticState, goal: str, return_mode: bool) -
 
 
 def build_action_page(state: SemanticState, goal: str, *, page_index: int = 0, page_size: int = 10,
-                      max_pages: int = 3, can_complete: bool = False, return_mode: bool = False) -> ActionPage:
+                      max_pages: int = 3, can_complete: bool = False, return_mode: bool = False,
+                      task_spec: TaskSpec | None = None) -> ActionPage:
     """Build one ranked, bounded action page plus global safety controls."""
-    device_actions = _ranked_device_actions(state, goal, return_mode)
+    device_actions = _ranked_device_actions(state, goal, return_mode, task_spec or task_spec_from_goal(goal))
     if can_complete:
         return ActionPage(index=0, total_pages=1, total_device_actions=0, actions=[
             CandidateAction(id="DONE", kind=ActionKind.DONE, label="Task complete"),
@@ -189,6 +223,9 @@ def build_action_page(state: SemanticState, goal: str, *, page_index: int = 0, p
     return ActionPage(index=page_index, total_pages=usable_pages, total_device_actions=len(device_actions), actions=actions)
 
 
-def build_candidates(state: SemanticState, goal: str, can_complete: bool = False, return_mode: bool = False) -> list[CandidateAction]:
+def build_candidates(state: SemanticState, goal: str, can_complete: bool = False, return_mode: bool = False,
+                     task_spec: TaskSpec | None = None) -> list[CandidateAction]:
     """Compatibility helper returning the first page for inspect and tests."""
-    return build_action_page(state, goal, can_complete=can_complete, return_mode=return_mode).actions
+    return build_action_page(
+        state, goal, can_complete=can_complete, return_mode=return_mode, task_spec=task_spec,
+    ).actions

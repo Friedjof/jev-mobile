@@ -14,6 +14,7 @@ from typesafe_sdk import AsyncTypeSafeClient, Choice
 from ..actions.models import CandidateAction, Decision
 from ..prompts import decision_policy
 from ..state.models import SemanticState
+from ..tasks import TaskInterpretation, deterministic_interpretation
 from .base import ProviderUnavailable
 
 
@@ -42,15 +43,25 @@ def build_jev_state(
                     "id": element.id,
                     "role": element.role,
                     "text": element.label,
+                    "value": element.value,
+                    "accessible_label": element.accessible_label,
+                    "field_name": element.field_name,
+                    "field_role": element.field_role,
+                    "hint": element.hint,
+                    "state_description": element.state_description,
+                    "resource_id": element.resource_id,
                     "clickable": element.clickable,
                     "editable": element.editable,
                     "enabled": element.enabled,
                     "selected": element.selected,
+                    "focused": element.focused,
+                    "multiline": element.multiline,
                 }
                 for element in elements
             ][:24],
         },
-        "recent_context": [],
+        "recent_context": state.recent_context[-12:],
+        "agent_context": state.agent_context,
         "dialog": state.dialog.model_dump(mode="json") if state.dialog else None,
     }
 
@@ -90,6 +101,47 @@ class JevProvider:
     def __init__(self, api_key: str | None, system_prompt: str | None = None) -> None:
         self._api_key = api_key
         self._system_prompt = system_prompt
+
+    async def interpret_task(self, goal: str, state: SemanticState) -> TaskInterpretation:
+        """Use cheap System-One choices for small remaining intent ambiguities."""
+        if not self._api_key:
+            return deterministic_interpretation(goal)
+        interpretation = deterministic_interpretation(goal)
+        if interpretation.task_spec.intent != "create_note":
+            return interpretation
+        compact = build_jev_state(goal, state)
+        try:
+            async with AsyncTypeSafeClient(api_key=self._api_key) as client:
+                response = await client.system_one(
+                    state={
+                        "goal": goal,
+                        "deterministic_extraction": interpretation.model_dump(mode="json"),
+                        "ui": compact["screen"],
+                    },
+                    questions={
+                        "content_type": Choice(
+                            instructions="Classify the requested note content. Choose UNKNOWN only if wording is ambiguous.",
+                            criteria={
+                                "TEXT_NOTE": "Write the supplied content as normal note body text.",
+                                "CHECKLIST": "Create a checklist from the supplied item candidates.",
+                                "UNKNOWN": "The wording does not determine a safe content type.",
+                            },
+                        ),
+                        "title": Choice(
+                            instructions="Decide whether an explicit title is required by the task.",
+                            criteria={
+                                "NO_TITLE": "No title was explicitly requested.",
+                                "Shopping": "Use Shopping as a concise title.",
+                                "UNKNOWN": "Title intent is ambiguous and needs stronger reasoning.",
+                            },
+                        ),
+                    },
+                )
+        except Exception as error:
+            raise ProviderUnavailable(f"Jev interpretation failed ({_safe_error_summary(error)})") from error
+        content_type = response.answers["content_type"].choice
+        title = response.answers["title"].choice
+        return interpretation.model_copy(update={"content_type": content_type, "title": title})
 
     async def decide(self, goal: str, state: SemanticState, actions: list[CandidateAction]) -> Decision:
         if not self._api_key:
