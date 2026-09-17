@@ -15,6 +15,7 @@ class ActionKind(StrEnum):
     BACK = "back"
     LAUNCH_APP = "launch_app"
     WAIT = "wait"
+    MORE_ACTIONS = "more_actions"
     ESCALATE = "escalate"
     DONE = "done"
 
@@ -34,6 +35,16 @@ class CandidateAction(BaseModel):
     text: str | None = None
     package: str | None = None
     risk: ActionRisk = ActionRisk.READ_ONLY
+    goal_directed: bool = False
+
+
+class ActionPage(BaseModel):
+    """A bounded, ranked slice of valid actions for one stable UI state."""
+
+    index: int
+    total_pages: int
+    total_device_actions: int
+    actions: list[CandidateAction]
 
 
 class Decision(BaseModel):

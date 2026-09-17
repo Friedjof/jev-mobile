@@ -12,6 +12,7 @@ from typing import Any
 from typesafe_sdk import AsyncTypeSafeClient, Choice
 
 from ..actions.models import CandidateAction, Decision
+from ..prompts import decision_policy
 from ..state.models import SemanticState
 from .base import ProviderUnavailable
 
@@ -50,6 +51,7 @@ def build_jev_state(
             ][:24],
         },
         "recent_context": [],
+        "dialog": state.dialog.model_dump(mode="json") if state.dialog else None,
     }
 
 
@@ -85,8 +87,9 @@ class JevProvider:
 
     name = "jev"
 
-    def __init__(self, api_key: str | None) -> None:
+    def __init__(self, api_key: str | None, system_prompt: str | None = None) -> None:
         self._api_key = api_key
+        self._system_prompt = system_prompt
 
     async def decide(self, goal: str, state: SemanticState, actions: list[CandidateAction]) -> Decision:
         if not self._api_key:
@@ -103,12 +106,9 @@ class JevProvider:
                     "state": compact_state,
                     "questions": {
                         "next_action": Choice(
-                            instructions=(
-                                "This is one step in a multi-step control loop. Choose exactly one listed "
-                                "safe next action that advances the goal; do not require it to finish the "
-                                "whole goal in this step. "
-                                "Choose the escalate action when no listed action is clearly appropriate."
-                            ),
+                            instructions=(decision_policy(self._system_prompt) + "\n\n"
+                                "This is one step in a multi-step control loop. The concrete task is in "
+                                "state.goal. Choose exactly one listed candidate action for the current state."),
                             criteria=criteria,
                         )
                     },

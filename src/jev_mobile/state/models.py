@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from enum import StrEnum
 from typing import Any
 from pydantic import BaseModel, Field
 
@@ -44,6 +45,20 @@ class RawDeviceState(BaseModel):
     observed_at_monotonic: float = 0.0
 
 
+class DialogKind(StrEnum):
+    SAFE_DISMISSIBLE = "safe_dismissible"
+    PERMISSION = "permission"
+    SENSITIVE = "sensitive"
+    UNKNOWN = "unknown"
+
+
+class DialogInfo(BaseModel):
+    kind: DialogKind
+    title: str | None = None
+    message: str | None = None
+    safe_dismiss_element_ids: list[str] = Field(default_factory=list)
+
+
 class SemanticElement(BaseModel):
     id: str
     role: str
@@ -57,6 +72,7 @@ class SemanticElement(BaseModel):
     selected: bool
     visible: bool
     scrollable: bool
+    focused: bool = False
     depth: int
     raw_index: int
 
@@ -67,5 +83,6 @@ class SemanticState(BaseModel):
     elements: list[SemanticElement]
     fingerprint: str
     loading: bool = False
+    dialog: DialogInfo | None = None
     truncated: bool = False
     raw_snapshot_id: str | None = None

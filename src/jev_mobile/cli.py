@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from dataclasses import replace
 import typer
-from .actions.builder import build_candidates
+from .actions.builder import build_action_page
 from .cli_output import RunReporter, console, render_actions, render_decision, render_result, render_state
 from .config import Settings
 from .controller.loop import MobileController
@@ -18,6 +17,8 @@ from .providers.mock import MockProvider
 from .providers.jev import probability_margin
 from .providers.system_one_llm import SystemOneLLMProvider
 from .providers.base import ProviderUnavailable
+from .providers.planned import PlanGuidedProvider
+from .escalation.planner import LLMPlanner
 from .state.normalize import normalize
 from .tracing.trace import TraceWriter
 
@@ -27,9 +28,9 @@ app = typer.Typer(no_args_is_help=True)
 def _provider(name: str, settings: Settings):
     if name == "heuristic": return HeuristicProvider()
     if name == "mock": return MockProvider()
-    if name == "llm": return LLMProvider(settings.llm_base_url, settings.llm_api_key, settings.llm_model)
-    if name == "jev": return JevProvider(settings.typesafe_api_key)
-    if name == "system-one-llm": return SystemOneLLMProvider(settings.llm_base_url, settings.llm_api_key, settings.llm_model)
+    if name == "llm": return LLMProvider(settings.llm_base_url, settings.llm_api_key, settings.llm_model, settings.agent_system_prompt)
+    if name == "jev": return JevProvider(settings.typesafe_api_key, settings.agent_system_prompt)
+    if name == "system-one-llm": return SystemOneLLMProvider(settings.llm_base_url, settings.llm_api_key, settings.llm_model, settings.agent_system_prompt)
     raise typer.BadParameter("provider must be mock, heuristic, llm, system-one-llm, or jev")
 
 
@@ -63,7 +64,8 @@ def inspect(serial: str | None = typer.Option(None)) -> None:
         async with MobileMcpAdapter(settings.mobile_mcp_command, serial or settings.device_serial) as device:
             state = normalize(await device.observe())
             render_state(state)
-            render_actions(build_candidates(state, ""))
+            page = build_action_page(state, "")
+            render_actions(page.actions, page)
     asyncio.run(run())
 
 
@@ -82,7 +84,8 @@ def decide(
             raise typer.Exit(2)
         async with MobileMcpAdapter(settings.mobile_mcp_command, serial or settings.device_serial) as device:
             state = normalize(await device.observe())
-            actions = build_candidates(state, goal)
+            page = build_action_page(state, goal, page_size=settings.action_page_size, max_pages=settings.max_action_pages)
+            actions = page.actions
             try:
                 result = await decision_provider.decide(goal, state, actions)
             except ProviderUnavailable as error:
@@ -90,8 +93,8 @@ def decide(
                 raise typer.Exit(2) from error
             console.print("[bold blue]Dry run — no phone action will be performed.[/]")
             render_state(state)
-            render_actions(actions)
-            render_decision(provider, result, probability_margin(result.probabilities or {}))
+            render_actions(actions, page)
+            render_decision(provider, result, probability_margin(result.probabilities or {}), actions)
     asyncio.run(evaluate())
 
 
@@ -104,6 +107,8 @@ def run(
     confidence_threshold: float | None = typer.Option(None, "--confidence-threshold", min=0.0, max=1.0),
     minimum_probability_margin: float | None = typer.Option(None, "--minimum-probability-margin", min=0.0, max=1.0),
     max_steps: int | None = typer.Option(None, "--max-steps", min=1),
+    plan_first: bool = typer.Option(False, "--plan-first", help="Ask the configured LLM for a structured task plan before the first action."),
+    plan_on_escalation: bool = typer.Option(False, "--plan-on-escalation", help="Let the configured LLM create one text-only recovery plan when the fast provider is uncertain."),
 ) -> None:
     """Run a bounded safe control task."""
     async def execute() -> None:
@@ -114,11 +119,27 @@ def run(
             settings = replace(settings, minimum_probability_margin=minimum_probability_margin)
         if max_steps is not None:
             settings = replace(settings, max_steps=max_steps)
+        decision_provider = _provider(provider, settings)
+        if plan_on_escalation or plan_first:
+            if not all((settings.llm_base_url, settings.llm_api_key, settings.llm_model)):
+                typer.echo(
+                    "LLM recovery planning requires LLM_BASE_URL, LLM_API_KEY, and LLM_MODEL in .env",
+                    err=True,
+                )
+                raise typer.Exit(2)
+            planner = LLMPlanner(settings.llm_base_url, settings.llm_api_key, settings.llm_model,
+                                 settings.agent_system_prompt)
+            decision_provider = PlanGuidedProvider(
+                decision_provider, planner, confidence_threshold=settings.confidence_threshold,
+                minimum_probability_margin=settings.minimum_probability_margin,
+                max_recoveries=settings.max_plan_recoveries,
+                plan_first=plan_first,
+            )
         async with MobileMcpAdapter(settings.mobile_mcp_command, serial or settings.device_serial) as device:
             if start_app:
                 console.print(f"[cyan]Bootstrap:[/] launching {start_app}")
                 await device.launch_app(start_app)
             trace = TraceWriter(settings.trace_dir)
-            result = await MobileController(device, _provider(provider, settings), settings, trace, RunReporter()).run(goal)
+            result = await MobileController(device, decision_provider, settings, trace, RunReporter()).run(goal)
             render_result(result.status.value, result.message, trace.path)
     asyncio.run(execute())

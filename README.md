@@ -78,6 +78,8 @@ The live CLI shows the current stable UI, candidate actions, Jev confidence and 
 - Pluggable `jev`, `system-one-llm`, `heuristic`, and `mock` decision providers
 - Confidence and top-two probability-margin safety gates
 - Bounded loops, repeated-state detection, escalation checkpoints, and JSONL traces
+- Ranked action pages that prevent crowded screens from overwhelming Jev
+- Conservative popup detection with safe dismissal or screenshot-backed escalation
 - Human-friendly `devices`, `inspect`, `decide`, and `run` CLI output
 
 ### Deliberately not solved yet
@@ -140,11 +142,39 @@ uv run jev-mobile run \
   --start-app com.android.settings
 ```
 
-`run` executes only read-only navigation candidates in the current PoC. The default confidence threshold is `0.80`; low-confidence or low-margin decisions create an escalation checkpoint instead of acting.
+`run` executes read-only navigation and explicitly classified reversible candidates in the current PoC. External-effect and sensitive actions always create an escalation checkpoint. The default confidence threshold is `0.80`; low-confidence or low-margin decisions also create an escalation checkpoint instead of acting.
+
+See [current PoC limitations and next steps](docs/current-limitations.md) for the intentionally unfinished areas, including checklist authoring, visual escalation, free-form text generation, and durable resume.
+
+Crowded screens are presented in ranked pages (10 device actions by default). Choosing `More actions` advances locally to the next page without touching the phone. A clearly safe popup dismissal may be executed. Every detected modal also offers `Dismiss popup with Back`; permission prompts, confirmations, and unknown dialogs never expose an accept/continue action and retain escalation as a safe alternative.
+
+### Optional LLM planning and recovery
+
+Jev remains the fast, per-step decision provider. If it is uncertain, an optional OpenAI-compatible LLM can create one short, text-only recovery plan, after which the Jev loop continues using the plan's current checkpoint as context:
+
+```bash
+uv run jev-mobile run \
+  --goal "Open Network & internet settings and then go back" \
+  --provider jev \
+  --plan-first \
+  --plan-on-escalation
+```
+
+Set `LLM_BASE_URL`, `LLM_API_KEY`, and `LLM_MODEL` in `.env`. `--plan-first` asks the LLM for bounded steps and visible completion criteria before the first action. When the controller later believes it is done, the same LLM reviews the current semantic UI against those criteria. The planner receives no device tools, cannot create actions, and cannot bypass candidate-action or risk checks. It is attempted once by default (`MAX_PLAN_RECOVERIES=1`). If it cannot recover safely, the task still creates the normal resumable escalation checkpoint.
 
 ## Providers
 
 All providers receive the same goal, compact semantic state, and fixed candidate actions.
+
+### Operating policy and task
+
+Every decision receives a built-in operating policy (safe candidate-only control, verified completion, and explicit-text handling) separately from the concrete task in `state.goal`. Add project-specific rules without replacing those safeguards:
+
+```env
+MOBILE_AGENT_SYSTEM_PROMPT=Use German UI labels when available. Prefer local draft actions.
+```
+
+The CLI goal remains the actual task, for example `--goal "Create a new note: Eggs, bread"`.
 
 | Provider | Purpose |
 | --- | --- |
@@ -161,6 +191,8 @@ The Jev provider uses the official `AsyncTypeSafeClient`. A Choice response is r
 - Jev sees only prevalidated candidates; it cannot issue raw device commands.
 - Intermediate/loading states are held back until the UI is semantically stable.
 - `ESCALATE` is always available.
+- Crowded screens are ranked into bounded action pages; `More actions` is a local controller step, not a device command.
+- Only explicit harmless popup dismissals are autonomous; permissions, confirmations, and unknown dialogs escalate with a screenshot checkpoint.
 - Low confidence, a small top-two probability margin, repeated states, loops, timeouts, and step limits stop automation.
 - `EXTERNAL_EFFECT` and `SENSITIVE` action classes are not autonomously executed.
 - API keys and authorization headers are never written to traces.

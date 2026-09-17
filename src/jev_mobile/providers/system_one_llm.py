@@ -8,6 +8,7 @@ from system_one_adapter import AsyncSystemOneAdapterClient, Choice
 from system_one_adapter.providers.openai import AsyncOpenAIProvider
 
 from ..actions.models import CandidateAction, Decision
+from ..prompts import decision_policy
 from ..state.models import SemanticState
 from .base import ProviderUnavailable
 from .jev import build_jev_state, probability_margin
@@ -18,10 +19,12 @@ class SystemOneLLMProvider:
 
     name = "system-one-llm"
 
-    def __init__(self, base_url: str | None, api_key: str | None, model: str | None) -> None:
+    def __init__(self, base_url: str | None, api_key: str | None, model: str | None,
+                 system_prompt: str | None = None) -> None:
         self._base_url = base_url
         self._api_key = api_key
         self._model = model
+        self._system_prompt = system_prompt
 
     async def decide(self, goal: str, state: SemanticState, actions: list[CandidateAction]) -> Decision:
         if not self._api_key or not self._model:
@@ -40,12 +43,9 @@ class SystemOneLLMProvider:
                     state=compact_state,
                     questions={
                         "next_action": Choice(
-                            instructions=(
-                                "This is one step in a multi-step control loop. Choose exactly one listed "
-                                "safe next action that advances the goal; do not require it to finish the "
-                                "whole goal in this step. "
-                                "Choose the escalate action when no listed action is clearly appropriate."
-                            ),
+                            instructions=(decision_policy(self._system_prompt) + "\n\n"
+                                "This is one step in a multi-step control loop. The concrete task is in "
+                                "state.goal. Choose exactly one listed candidate action for the current state."),
                             criteria=criteria,
                         )
                     },

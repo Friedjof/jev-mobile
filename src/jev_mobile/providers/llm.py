@@ -6,18 +6,21 @@ import httpx
 import json
 from ..actions.models import CandidateAction, Decision
 from ..state.models import SemanticState
+from ..prompts import decision_policy
 from .base import ProviderUnavailable
 
 
 class LLMProvider:
     name = "llm"
-    def __init__(self, base_url: str | None, api_key: str | None, model: str | None) -> None:
+    def __init__(self, base_url: str | None, api_key: str | None, model: str | None,
+                 system_prompt: str | None = None) -> None:
         if not all((base_url, api_key, model)): raise ProviderUnavailable("LLM_BASE_URL, LLM_API_KEY, and LLM_MODEL are required")
         self.base_url, self.api_key, self.model = base_url.rstrip("/"), api_key, model
+        self.system_prompt = system_prompt
 
     async def decide(self, goal: str, state: SemanticState, actions: list[CandidateAction]) -> Decision:
-        payload = {"model": self.model, "temperature": 0, "response_format": {"type": "json_object"}, "messages": [
-            {"role": "system", "content": "Select exactly one supplied action. Return JSON: {action_id, confidence}. Never invent actions."},
+        payload = {"model": self.model, "response_format": {"type": "json_object"}, "messages": [
+            {"role": "system", "content": decision_policy(self.system_prompt) + "\n\nReturn JSON: {action_id, confidence}."},
             {"role": "user", "content": json.dumps({"goal": goal, "state": state.model_dump(mode="json"), "actions": [a.model_dump(mode="json") for a in actions]})},
         ]}
         async with httpx.AsyncClient(timeout=20) as client:
