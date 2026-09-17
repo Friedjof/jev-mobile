@@ -1,0 +1,33 @@
+[project]
+name = "jev-mobile"
+version = "0.1.0"
+description = "Fast, structured Android control loops with pluggable decision providers."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.28,<1",
+    "mcp>=2.2,<3",
+    "pydantic>=2.10,<3",
+    "python-dotenv>=1.0,<2",
+    "rich>=13,<15",
+    "system-one-adapter[openai]>=0.1.4",
+    "typer>=0.15,<1",
+    "typesafe-sdk>=0.6.0",
+]
+
+[project.scripts]
+jev-mobile = "jev_mobile.cli:app"
+
+[dependency-groups]
+dev = ["pytest>=8.3,<9", "pytest-asyncio>=0.25,<1"]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/jev_mobile"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

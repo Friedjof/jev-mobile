@@ -1,0 +1,52 @@
+"""Runtime configuration loaded from environment variables."""
+
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from dotenv import load_dotenv
+
+
+@dataclass(frozen=True, slots=True)
+class Settings:
+    mobile_mcp_command: tuple[str, ...]
+    device_serial: str | None
+    trace_dir: Path
+    minimum_stable_time_seconds: float
+    stabilizer_timeout_seconds: float
+    confidence_threshold: float
+    minimum_probability_margin: float = 0.15
+    max_steps: int = 20
+    max_runtime_seconds: float = 90.0
+    max_same_state_count: int = 3
+    max_action_retries: int = 2
+    max_escalations: int = 3
+    llm_base_url: str | None = None
+    llm_api_key: str | None = None
+    llm_model: str | None = None
+    typesafe_api_key: str | None = None
+
+    @classmethod
+    def from_env(cls) -> "Settings":
+        load_dotenv()
+        command = os.getenv("MOBILE_MCP_COMMAND_JSON", '["npx", "-y", "@mobilenext/mobile-mcp@1.0.4"]')
+        try:
+            parsed = tuple(json.loads(command)) if command else ()
+        except json.JSONDecodeError as error:
+            raise ValueError("MOBILE_MCP_COMMAND_JSON must be a JSON string array") from error
+        if not all(isinstance(item, str) and item for item in parsed):
+            raise ValueError("MOBILE_MCP_COMMAND_JSON must contain non-empty strings")
+        return cls(
+            mobile_mcp_command=parsed, device_serial=os.getenv("MOBILE_DEVICE_SERIAL") or None,
+            trace_dir=Path(os.getenv("TRACE_DIR", "traces")),
+            minimum_stable_time_seconds=float(os.getenv("MINIMUM_STABLE_TIME_SECONDS", "0.25")),
+            stabilizer_timeout_seconds=float(os.getenv("STABILIZER_TIMEOUT_SECONDS", "5")),
+            confidence_threshold=float(os.getenv("DECISION_CONFIDENCE_THRESHOLD", "0.80")),
+            minimum_probability_margin=float(os.getenv("MINIMUM_PROBABILITY_MARGIN", "0.15")),
+            llm_base_url=os.getenv("LLM_BASE_URL") or None,
+            llm_api_key=os.getenv("LLM_API_KEY") or None,
+            llm_model=os.getenv("LLM_MODEL") or None,
+            typesafe_api_key=os.getenv("TYPESAFE_API_KEY") or None,
+        )
