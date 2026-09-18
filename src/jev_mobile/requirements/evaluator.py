@@ -6,11 +6,19 @@ from ..state.models import SemanticState
 from ..tasks import RequirementStatus, TaskSpec
 from .generators import generate_requirements
 from .requirement import Requirement
+from .information import InformationMatchStatus, extract_information
 
 
 class RequirementEvaluator:
-    def evaluate(self, task_spec: TaskSpec, state: SemanticState) -> list[Requirement]:
+    def evaluate(
+        self,
+        task_spec: TaskSpec,
+        state: SemanticState,
+        semantic_selections: dict[str, str] | None = None,
+    ) -> list[Requirement]:
         values = generate_requirements(task_spec)
+        information_requests = {request.key: request for request in task_spec.information_requests}
+        semantic_selections = semantic_selections or {}
         visible = " ".join(item.value or item.label or "" for item in state.elements if item.visible)
         folded = " ".join(visible.casefold().split())
         visible_elements = [item for item in state.elements if item.visible]
@@ -56,6 +64,33 @@ class RequirementEvaluator:
             elif requirement.kind == "app_open":
                 satisfied = bool(state.app and requirement.expected and requirement.expected.casefold() in state.app.casefold())
                 observed_value = state.app if satisfied else None
+            elif requirement.kind == "information_observed" and requirement.output_key:
+                request = information_requests.get(requirement.output_key)
+                match = extract_information(
+                    request,
+                    state,
+                    selected_candidate_id=semantic_selections.get(requirement.output_key),
+                ) if request else None
+                satisfied = bool(match and match.status == InformationMatchStatus.OBSERVED and match.candidate)
+                if satisfied and match and match.candidate:
+                    observed_value = match.candidate.value
+                    requirement.evidence = {
+                        "snapshot_id": state.raw_snapshot_id,
+                        "package": state.app,
+                        "semantic_role": match.candidate.semantic_role,
+                        "label": match.candidate.label,
+                        "observed_value": match.candidate.value,
+                        "confidence": match.candidate.confidence,
+                    }
+                elif match and match.status == InformationMatchStatus.AMBIGUOUS:
+                    requirement.evidence = {
+                        "ambiguity": [candidate.model_dump(mode="json") for candidate in match.candidates],
+                    }
+                    requirement.reason = "multiple observed values require a semantic selection"
+                elif match and match.status == InformationMatchStatus.PROHIBITED:
+                    requirement.reason = "sensitive value extraction is prohibited"
+                else:
+                    requirement.reason = "requested information was not observed"
             elif requirement.kind == "note_created":
                 satisfied = bool(task_spec.title and task_spec.title.casefold() in folded)
                 evidence_element = next(
@@ -95,7 +130,7 @@ class RequirementEvaluator:
             else:
                 satisfied = False
             requirement.status = RequirementStatus.SATISFIED if satisfied else RequirementStatus.UNSATISFIED
-            if satisfied:
+            if satisfied and not requirement.evidence:
                 requirement.evidence = {
                     "snapshot_id": state.raw_snapshot_id,
                     "package": state.app,
@@ -108,7 +143,7 @@ class RequirementEvaluator:
                     "confidence": 1.0,
                 }
                 requirement.reason = "observed on the current UI snapshot"
-            else:
+            elif not requirement.reason:
                 requirement.reason = "not observed on the current UI snapshot"
         return values
 

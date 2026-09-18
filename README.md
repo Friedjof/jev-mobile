@@ -73,6 +73,8 @@ Android actions and reports progress, evidence and final verification through
 - Durable SQLite tasks, leases, checkpoints, cancellation and worker recovery
 - Independent persistence verification and foreign-entity write protection
 - Scoped approval for risky lifecycle recovery and safe terminal boundaries
+- Structured durable clarification questions with schema-validated `answer_task`
+- Evidence-backed read-only information tasks for accessible label/value UI
 - Public stdio MCP task delegation and a deterministic Android acceptance fixture
 
 ### Deliberately not solved yet
@@ -80,7 +82,7 @@ Android actions and reports progress, evidence and final verification through
 - Broad app coverage beyond the validated Keep/fixture scenarios
 - Vision-first navigation and richer visual reasoning
 - Advanced recovery/exploration and benchmark dashboards
-- OpenClaw-specific registration (the generic MCP contract is ready)
+- Broad read-task vocabulary and extraction across arbitrary custom widgets
 - A hosted/cloud service
 
 ## Installation

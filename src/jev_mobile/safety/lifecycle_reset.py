@@ -3,6 +3,7 @@
 from enum import StrEnum
 
 from ..agent.grounding import EntityOwnership, InteractionContext
+from ..tasks import AnswerEffect, AnswerEffectKind, QuestionOption, QuestionType, make_question
 
 
 class LifecycleResetDecision(StrEnum):
@@ -26,6 +27,14 @@ def evaluate_reset_safety(*, task_id: str, package: str, ownership: EntityOwners
 
 
 def reset_question(package: str, operation: str = "reset_app_task") -> dict[str, object]:
-    from uuid import uuid4
     text = "The app keeps reopening an existing editor. Resetting the app's current navigation task may discard unsaved changes in that editor. May I reset the app task?" if operation == "reset_app_task" else "The app keeps restoring an existing editor even after resetting navigation. Restarting the app may discard unsaved changes in that editor. May I restart the app?"
-    return {"id": f"q_{uuid4().hex}", "type": "approve_lifecycle_recovery", "operation": operation, "package": package, "text": text, "options": ["allow", "deny"]}
+    return make_question(
+        question_type=QuestionType.APPROVAL,
+        reason="LIFECYCLE_RECOVERY_REQUIRES_APPROVAL",
+        prompt_key=f"approve:{operation}:{package}",
+        text=text,
+        options=[QuestionOption(id="allow", label="Allow"), QuestionOption(id="deny", label="Deny")],
+        effect=AnswerEffect(kind=AnswerEffectKind.AUTHORIZE_OPERATION, parameter=operation),
+        operation=operation,
+        package=package,
+    ).model_dump(mode="json")

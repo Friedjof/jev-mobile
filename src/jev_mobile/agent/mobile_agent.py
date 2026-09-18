@@ -21,9 +21,18 @@ from ..state.normalize import normalize
 from ..state.models import SemanticState
 from ..task_store import MobileTask, TaskStatus, TaskStore
 from ..tasks import (
+    AnswerEffect,
+    AnswerEffectKind,
+    QuestionOption,
+    QuestionSpec,
+    QuestionType,
     RequirementStatus,
     TaskContractStatus,
+    TaskPolicyMode,
     TaskSpec,
+    contract_question,
+    information_authorization_question,
+    make_question,
     task_spec_from_goal,
     validate_task_contract,
 )
@@ -73,6 +82,13 @@ class MobileAgent:
                     latest = self.store.get(task.id)
                     cancellation_requested = bool(latest and latest.cancellation_requested)
                     before = normalize(await device.observe())
+                    resumed_question = task.agent_context.pop("resume_requires_fresh_observation", None)
+                    if resumed_question:
+                        self.store.save(task)
+                        self.store.event(task.id, "INPUT_RESUME_OBSERVATION", {
+                            "question_id": resumed_question,
+                            "snapshot": before.fingerprint,
+                        }, task.worker_id)
                     interaction_context = context_type(before)
                     ownership = ownership_for(before, task.agent_context)
                     if task.pending_mutation:
@@ -170,7 +186,12 @@ class MobileAgent:
                         break
                     catalog = ActionCatalog.build(before, refs)
                     safe_creation = evaluate_safe_creation_context(before, target_package=task.task_spec.app_package, ownership=ownership, actions=catalog.actions)
-                    requirements = evaluator.evaluate(task.task_spec, before)
+                    selections = task.agent_context.get("semantic_selections")
+                    requirements = evaluator.evaluate(
+                        task.task_spec,
+                        before,
+                        selections if isinstance(selections, dict) else None,
+                    )
                     observed_evidence = {
                         requirement.key: self._requirement_evidence(requirement)
                         for requirement in requirements
@@ -227,7 +248,12 @@ class MobileAgent:
                         task.result = self._verified_result(task, requirements, step, trace)
                         break
                     context = before.model_copy(update={"agent_context": {"task_spec": task.task_spec.model_dump(mode="json"), "current_subgoal": task.current_subgoal, "requirements": {r.key: r.status.value for r in requirements}, "history": history[-6:]}})
-                    candidates, mapping = self._candidates(catalog, refs, requirements, task.task_spec, before.app, history, before.fingerprint, interaction_context, ownership, orientation)
+                    input_question = self._ambiguity_question(task, requirements)
+                    candidates, mapping = self._candidates(
+                        catalog, refs, requirements, task.task_spec, before.app, history,
+                        before.fingerprint, interaction_context, ownership, orientation,
+                        input_question=input_question,
+                    )
                     started = time.monotonic()
                     try: decision = await self.provider.decide(task.instruction, context, candidates)
                     except ProviderUnavailable as error:
@@ -240,6 +266,11 @@ class MobileAgent:
                         return
                     selected = next((a for a in candidates if a.id == decision.action_id), None)
                     if selected is None: raise RuntimeError("Jev selected an invalid action")
+                    if selected.kind == ActionKind.REQUEST_INPUT:
+                        if not selected.question:
+                            raise RuntimeError("REQUEST_INPUT action has no QuestionSpec")
+                        self._pause_for_input(task, QuestionSpec.model_validate(selected.question))
+                        return
                     action, ref, catalog_target = mapping[selected.id]
                     family = action.mutation_family
                     if action.kind == ActionKind.OPEN_APP_ROOT:
@@ -271,7 +302,9 @@ class MobileAgent:
         except Exception as error:
             task.status, task.failure_reason = TaskStatus.FAILED, str(error)
         finally:
-            task.finished_at = datetime.now(UTC); self.store.save(task)
+            if task.status in {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELLED}:
+                task.finished_at = datetime.now(UTC)
+            self.store.save(task)
 
     @staticmethod
     async def _observe(device: DeviceAdapter): return normalize(await device.observe())
@@ -279,6 +312,12 @@ class MobileAgent:
     async def _resolve_task_contract(self, task: MobileTask) -> MobileTask | None:
         validation = validate_task_contract(task.task_spec)
         if validation.valid:
+            authorizations = task.agent_context.get("information_authorizations")
+            authorized_keys = set(authorizations) if isinstance(authorizations, dict) else set()
+            authorization_question = information_authorization_question(task.task_spec, authorized_keys)
+            if authorization_question:
+                self._pause_for_input(task, authorization_question)
+                return None
             if task.contract_status != TaskContractStatus.READY or task.contract_errors:
                 task.contract_status = TaskContractStatus.READY
                 task.contract_errors = []
@@ -320,7 +359,16 @@ class MobileAgent:
                     "requirements": len(proposed.completion),
                 }, task.worker_id)
                 return task
+            task.task_spec = proposed
             validation = proposed_validation
+
+        answered_prompt_keys = {answer.prompt_key for answer in task.input_history}
+        question = contract_question(task.task_spec, validation.errors, answered_prompt_keys)
+        if question:
+            task.contract_status = TaskContractStatus.PENDING
+            task.contract_errors = validation.errors
+            self._pause_for_input(task, question)
+            return None
 
         declared = [item for item in generate_requirements(task.task_spec) if item.required]
         reason = "NO_VERIFIABLE_COMPLETION_CRITERIA" if not declared else "TASK_CONTRACT_INCOMPLETE"
@@ -378,10 +426,20 @@ class MobileAgent:
         }
 
     @staticmethod
-    def _candidates(catalog, refs, requirements, spec, current_package, history, state_fingerprint, interaction_context=InteractionContext.UNKNOWN, ownership=EntityOwnership.UNKNOWN, orientation="UNORIENTED"):
+    def _candidates(catalog, refs, requirements, spec, current_package, history, state_fingerprint, interaction_context=InteractionContext.UNKNOWN, ownership=EntityOwnership.UNKNOWN, orientation="UNORIENTED", input_question: QuestionSpec | None = None):
         actions, mapping = [], {}
+        if input_question:
+            action = CandidateAction(
+                id="request_input",
+                kind=ActionKind.REQUEST_INPUT,
+                label=f"Pause and request structured input: {input_question.reason}",
+                question=input_question.model_dump(mode="json"),
+            )
+            return [action], {action.id: (action, None, None)}
         texts = [r.expected for r in requirements if r.kind in {"title_equals", "checklist_item", "field_contains"} and r.status != RequirementStatus.SATISFIED and r.expected]
         entity_missing = any(r.kind == "note_created" and r.status != RequirementStatus.SATISFIED for r in requirements) and ownership != EntityOwnership.CURRENT_TASK
+        policy = getattr(spec, "policy", None)
+        read_only = bool(policy and policy.mode == TaskPolicyMode.READ_ONLY)
         suppressed = {item.get("signature") for item in history if item.get("state") == state_fingerprint and item.get("mutation") == MutationOutcome.EXECUTED_NO_EFFECT.value and sum(1 for other in history if other.get("signature") == item.get("signature") and other.get("state") == state_fingerprint and other.get("mutation") == MutationOutcome.EXECUTED_NO_EFFECT.value) >= 2}
         ordered = sorted(catalog.actions, key=lambda item: (0 if "set_text" in item.capabilities and item.semantic_role == "title" else 1, item.ref))
         for item in ordered:
@@ -393,6 +451,8 @@ class MobileAgent:
                 if not (item.semantic_role in {"image", "button"} and any(word in navigation_label for word in ("back", "navigate up", "up", "close", "cancel"))):
                     continue
             if "activate" in item.capabilities:
+                if read_only and not MobileAgent._read_navigation_allowed(item, spec):
+                    continue
                 family = MobileAgent._family_for_activate(item, requirements, ownership)
                 first_label = (item.label or "").casefold().strip().split(maxsplit=1)
                 if ownership == EntityOwnership.CURRENT_TASK and first_label and first_label[0] in {"create", "new", "add", "compose"}:
@@ -402,7 +462,7 @@ class MobileAgent:
             # An editor already open when this task starts may belong to an
             # unrelated entity.  Do not mutate it until this task has observed
             # creation/existence of its own entity.
-            if "set_text" in item.capabilities and not entity_missing and not foreign_editor:
+            if "set_text" in item.capabilities and not entity_missing and not foreign_editor and not read_only:
                 for text in texts:
                     a = CandidateAction(id=f"a{len(actions)}", kind=ActionKind.TYPE_TEXT, label=f'Set text "{text}" in role={item.semantic_role} current={item.current_value!r} ({item.ref})', text=text, risk=ActionRisk.REVERSIBLE, mutation_family=MutationFamily.TEXT_WRITE); actions.append(a); mapping[a.id] = (a, item.ref, item)
             if "scroll" in item.capabilities:
@@ -421,6 +481,11 @@ class MobileAgent:
         if entity_missing and spec.app_package and current_package != spec.app_package and roots:
             allowed = {action.id for action in roots}
             return [action for action in actions if action.id in allowed], {key: value for key, value in mapping.items() if key in allowed}
+        if read_only and spec.app_package and current_package != spec.app_package and roots:
+            allowed = {action.id for action in roots}
+            return [action for action in actions if action.id in allowed], {
+                key: value for key, value in mapping.items() if key in allowed
+            }
         if entity_missing and orientation == "READY" and creates:
             allowed = {action.id for action in creates}
             return [action for action in actions if action.id in allowed], {key: value for key, value in mapping.items() if key in allowed}
@@ -429,6 +494,73 @@ class MobileAgent:
             actions = [action for action in actions if action.id in allowed]
             mapping = {key: value for key, value in mapping.items() if key in allowed}
         return actions, mapping
+
+    @staticmethod
+    def _read_navigation_allowed(item, spec: TaskSpec) -> bool:
+        if item.risk != ActionRisk.READ_ONLY or item.semantic_role in {"checkbox", "switch", "toggle"}:
+            return False
+        label = (item.label or "").casefold()
+        if any(term in label for term in (
+            "delete", "remove", "save", "submit", "send", "buy", "purchase", "pay",
+            "löschen", "entfernen", "speichern", "senden", "kaufen",
+        )):
+            return False
+        hints = {
+            token
+            for request in spec.information_requests
+            for hint in request.semantic_hints
+            for token in hint.casefold().split()
+            if len(token) > 2
+        }
+        navigation = {
+            "about", "settings", "system", "device", "account", "profile", "information", "details",
+            "phone", "version", "info", "advanced", "preferences", "über", "gerät", "konto",
+            "einstellungen", "system",
+        }
+        return bool(set(label.replace("&", " ").split()) & (hints | navigation))
+
+    def _pause_for_input(self, task: MobileTask, question: QuestionSpec) -> None:
+        task.status = TaskStatus.WAITING_FOR_USER
+        task.waiting_question = question.model_dump(mode="json")
+        task.waiting_reason = question.text
+        task.lease_expires_at = None
+        self.store.save(task)
+        self.store.event(task.id, "TASK_WAITING_FOR_USER", {
+            "question": question.model_dump(mode="json"),
+        }, task.worker_id)
+
+    @staticmethod
+    def _ambiguity_question(task: MobileTask, requirements) -> QuestionSpec | None:
+        answered = {answer.prompt_key for answer in task.input_history}
+        for requirement in requirements:
+            ambiguity = requirement.evidence.get("ambiguity") if isinstance(requirement.evidence, dict) else None
+            if not isinstance(ambiguity, list) or not requirement.output_key:
+                continue
+            prompt_key = f"select_information:{requirement.output_key}"
+            if prompt_key in answered:
+                continue
+            options = [
+                QuestionOption(
+                    id=str(candidate["id"]),
+                    label=f"{candidate.get('label')}: {candidate.get('value')}",
+                )
+                for candidate in ambiguity
+                if isinstance(candidate, dict) and candidate.get("id") and candidate.get("value") is not None
+            ]
+            if len(options) < 2:
+                continue
+            return make_question(
+                question_type=QuestionType.SELECT_OPTION,
+                reason="AMBIGUOUS_OBSERVED_INFORMATION",
+                prompt_key=prompt_key,
+                text="Multiple matching values are visible. Which one should be returned?",
+                options=options,
+                effect=AnswerEffect(
+                    kind=AnswerEffectKind.SELECT_SEMANTIC_OPTION,
+                    parameter=requirement.output_key,
+                ),
+            )
+        return None
 
     @staticmethod
     def _operation(device, action):

@@ -23,6 +23,7 @@ class ActionKind(StrEnum):
     PREVIOUS_GROUP = "previous_group"
     SEARCH_RELEVANT = "search_relevant"
     ESCALATE = "escalate"
+    REQUEST_INPUT = "request_input"
     DONE = "done"
 
 
@@ -44,6 +45,7 @@ class CandidateAction(BaseModel):
     risk: ActionRisk = ActionRisk.READ_ONLY
     goal_directed: bool = False
     mutation_family: MutationFamily = MutationFamily.OTHER
+    question: dict[str, object] | None = None
 
 
 class ActionPage(BaseModel):

@@ -11,6 +11,7 @@ a general-purpose mobile automation service.
 - Unicode-safe text entry, independent persistence verification and a deterministic Android fixture.
 - Autonomous Google Keep checklist and text-note creation from the supported safe starting contexts.
 - Foreign-entity write protection plus durable, scoped approval for risky lifecycle recovery.
+- Controller-authored clarification pauses and evidence-backed read-only values from accessible label/value UI.
 
 ## Known limitations
 
@@ -41,6 +42,13 @@ If a target app persistently restores unrelated content after safe navigation,
 root entry, task reset and approved process restart, the task ends with the
 structured `SAFETY_BLOCKED / PERSISTED_FOREIGN_APP_STATE` outcome rather than
 risking user data.
+
+### Read tasks depend on accessible semantic structure
+
+The first read-task path can extract normal label/value, sibling and nested
+accessibility structures and safely ask when several values match. Canvas-only
+content, values absent from Accessibility, and broad natural-language queries
+without semantic hints remain unsupported rather than being invented.
 
 ### OpenClaw delegates through the generic MCP surface
 

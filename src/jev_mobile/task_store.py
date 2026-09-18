@@ -11,7 +11,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field, model_validator
 
-from .tasks import RequirementStatus, TaskContractStatus, TaskSpec, contract_status_for
+from .tasks import RequirementStatus, TaskContractStatus, TaskInputAnswer, TaskSpec, contract_status_for
 
 
 class TaskStatus(StrEnum):
@@ -42,6 +42,7 @@ class MobileTask(BaseModel):
     failure_reason: str | None = None
     waiting_reason: str | None = None
     waiting_question: dict[str, object] | None = None
+    input_history: list[TaskInputAnswer] = Field(default_factory=list)
     worker_id: str | None = None
     claimed_at: datetime | None = None
     heartbeat_at: datetime | None = None

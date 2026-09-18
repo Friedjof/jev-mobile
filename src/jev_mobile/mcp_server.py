@@ -30,7 +30,19 @@ from .device.portal_adb import PortalAdbDeviceAdapter
 from .agent.mobile_agent import MobileAgent
 from .requirements.generators import generate_requirements
 from .task_store import TaskStatus, TaskStore
-from .tasks import task_spec_from_goal
+from .tasks import (
+    AnswerEffect,
+    AnswerEffectKind,
+    AnswerSchema,
+    QuestionOption,
+    QuestionSpec,
+    QuestionType,
+    TaskInputAnswer,
+    apply_answer_effect,
+    contract_status_for,
+    task_spec_from_goal,
+    validate_question_answer,
+)
 from .providers.heuristic import HeuristicProvider
 from .providers.jev import JevProvider, probability_margin
 from .providers.llm import LLMProvider
@@ -152,13 +164,91 @@ async def answer_task(task_id: str, question_id: str, answer: str) -> dict[str, 
     if not task: raise ValueError("unknown task_id")
     if task.status != TaskStatus.WAITING_FOR_USER: raise ValueError("task is not waiting for user input")
     if not task.waiting_question or task.waiting_question.get("id") != question_id: raise ValueError("unknown question_id")
-    task.agent_context.setdefault("answers", []).append({"question_id": question_id, "answer": answer})
-    if task.waiting_question.get("type") in {"approve_lifecycle_recovery", "approve_lifecycle_reset"} and answer.casefold() == "allow":
-        task.agent_context["lifecycle_authorization"] = {"task_id": task.id, "question_id": question_id, "operation": task.waiting_question.get("operation"), "package": task.waiting_question.get("package"), "consumed": False}
-    task.status, task.waiting_reason, task.waiting_question = TaskStatus.QUEUED, None, None
+    question = _question_spec(task.waiting_question)
+    normalized_answer = validate_question_answer(question, answer)
+    task.input_history.append(TaskInputAnswer(
+        question_id=question.id,
+        prompt_key=question.prompt_key,
+        answer=normalized_answer,
+        effect=question.answer_effect,
+        answered_at=datetime.now(UTC).isoformat(),
+    ))
+    task.agent_context.setdefault("answers", []).append({
+        "question_id": question_id,
+        "prompt_key": question.prompt_key,
+        "answer": normalized_answer,
+        "effect": question.answer_effect.model_dump(mode="json"),
+    })
+    if question.answer_effect.kind in {
+        AnswerEffectKind.AUTHORIZE_OPERATION,
+        AnswerEffectKind.AUTHORIZE_INFORMATION,
+    }:
+        if normalized_answer == "allow":
+            if question.answer_effect.kind == AnswerEffectKind.AUTHORIZE_OPERATION:
+                task.agent_context["lifecycle_authorization"] = {
+                    "task_id": task.id, "question_id": question_id,
+                    "operation": question.operation or question.answer_effect.parameter,
+                    "package": question.package, "consumed": False,
+                }
+            else:
+                authorizations = task.agent_context.setdefault("information_authorizations", {})
+                for key in question.answer_effect.parameter.split(","):
+                    authorizations[key] = {"question_id": question.id, "consumed": False}
+        else:
+            task.agent_context.setdefault("denied_operations", []).append({
+                "operation": question.operation or question.answer_effect.parameter,
+                "package": question.package,
+                "question_id": question.id,
+            })
+            task.status = TaskStatus.FAILED
+            task.failure_reason = (
+                "ORIENTATION_BLOCKED_BY_USER_DENIAL"
+                if question.answer_effect.kind == AnswerEffectKind.AUTHORIZE_OPERATION
+                else "SENSITIVE_INFORMATION_DENIED"
+            )
+            task.finished_at = datetime.now(UTC)
+    elif question.answer_effect.kind == AnswerEffectKind.SELECT_SEMANTIC_OPTION:
+        task.agent_context.setdefault("semantic_selections", {})[question.answer_effect.parameter] = normalized_answer
+    else:
+        task.task_spec = apply_answer_effect(task.task_spec, question, normalized_answer)
+        task.contract_status = contract_status_for(task.task_spec)
+        task.contract_errors = []
+    if task.status != TaskStatus.FAILED:
+        task.status = TaskStatus.QUEUED
+        task.agent_context["resume_requires_fresh_observation"] = question.id
+    task.waiting_reason, task.waiting_question = None, None
     _task_store.save(task)
-    _task_store.event(task.id, "USER_ANSWER_RECEIVED", {"question_id": question_id, "answer": answer.casefold()})
+    _task_store.event(task.id, "USER_ANSWER_RECEIVED", {
+        "question_id": question_id,
+        "prompt_key": question.prompt_key,
+        "answer_kind": question.type.value,
+        "selected_option": normalized_answer if question.type != QuestionType.TEXT else None,
+        "effect": question.answer_effect.kind.value,
+    })
     return {"task_id": task.id, "status": task.status.value}
+
+
+def _question_spec(payload: dict[str, object]) -> QuestionSpec:
+    """Read current questions and migrate pre-schema lifecycle questions."""
+    if "answer_schema" in payload and "answer_effect" in payload:
+        return QuestionSpec.model_validate(payload)
+    options = [
+        QuestionOption(id=str(option), label=str(option).title())
+        for option in payload.get("options", []) if isinstance(option, str)
+    ]
+    operation = str(payload.get("operation") or "reset_app_task")
+    return QuestionSpec(
+        id=str(payload["id"]),
+        type=QuestionType.APPROVAL,
+        reason="LIFECYCLE_RECOVERY_REQUIRES_APPROVAL",
+        prompt_key=f"approve:{operation}:{payload.get('package') or ''}",
+        text=str(payload.get("text") or "Approval required"),
+        options=options,
+        answer_schema=AnswerSchema(type=QuestionType.APPROVAL),
+        answer_effect=AnswerEffect(kind=AnswerEffectKind.AUTHORIZE_OPERATION, parameter=operation),
+        operation=operation,
+        package=str(payload["package"]) if payload.get("package") else None,
+    )
 
 
 def _public_result(task) -> dict[str, object] | None:
@@ -185,6 +275,26 @@ def _public_result(task) -> dict[str, object] | None:
                         "category": "SAFETY_BLOCKED",
                         "reason": "PERSISTED_FOREIGN_APP_STATE",
                         "message": "The target app persistently restores unrelated content. Continuing would require destructive application-state reset.",
+                        "recoverable": False,
+                    },
+                }
+            if task.failure_reason == "ORIENTATION_BLOCKED_BY_USER_DENIAL":
+                return {
+                    "status": "failed",
+                    "failure": {
+                        "category": "SAFETY_BLOCKED",
+                        "reason": "USER_DENIED_RECOVERY",
+                        "message": "The requested recovery operation was denied; no Android action was executed.",
+                        "recoverable": False,
+                    },
+                }
+            if task.failure_reason == "SENSITIVE_INFORMATION_DENIED":
+                return {
+                    "status": "failed",
+                    "failure": {
+                        "category": "SAFETY_BLOCKED",
+                        "reason": "USER_DENIED_INFORMATION_DISCLOSURE",
+                        "message": "The requested personal information was not read or returned.",
                         "recoverable": False,
                     },
                 }
@@ -250,6 +360,11 @@ def _public_result(task) -> dict[str, object] | None:
         "summary": task.result.get("summary"),
         "verified": verified,
         "observations": observations,
+        "answers": [
+            {"key": key, "value": value.get("value")}
+            for key, value in observations.items()
+            if value.get("status") == "observed"
+        ],
         "requirements": safe_requirements,
         "steps": task.result.get("steps", task.step_number),
     }
@@ -264,6 +379,14 @@ def _public_contract(task) -> dict[str, object]:
         "target": {"app": spec.app, "package": spec.app_package},
         "policy": spec.policy.model_dump(mode="json") if spec.policy else None,
         "requested_outputs": [output.model_dump(mode="json") for output in spec.requested_outputs],
+        "information_requests": [
+            {
+                "key": request.key,
+                "question": request.question,
+                "sensitivity": request.sensitivity.value,
+            }
+            for request in spec.information_requests
+        ],
         "completion": [
             {"type": item.type, "field_role": item.field_role, "output_key": item.output_key}
             for item in spec.completion
