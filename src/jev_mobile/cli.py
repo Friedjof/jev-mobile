@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from datetime import datetime
+import json
+import logging
 import typer
 from .actions.builder import build_action_page
 from .cli_output import RunReporter, console, render_actions, render_decision, render_result, render_state
@@ -138,6 +141,7 @@ def health() -> None:
 @app.command()
 def worker(serial: str | None = typer.Option(None), backend: str = typer.Option("portal-adb"), provider: str = typer.Option("jev")) -> None:
     """Run the long-lived owner of one physical Android device."""
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     async def serve() -> None:
         settings = Settings.from_env(); selected = serial or settings.device_serial
         if not selected: raise typer.BadParameter("--serial (or MOBILE_DEVICE_SERIAL) is required")
@@ -148,8 +152,41 @@ def worker(serial: str | None = typer.Option(None), backend: str = typer.Option(
 
 
 @task_app.command("start")
-def task_start(instruction: str) -> None:
-    task = TaskStore().create(instruction, task_spec_from_goal(instruction))
+def task_start(instruction: str, idempotency_key: str | None = typer.Option(None, "--idempotency-key")) -> None:
+    task = TaskStore().create(
+        instruction, task_spec_from_goal(instruction), idempotency_key=idempotency_key,
+    )
+    typer.echo(f"{task.id}\t{task.status.value}")
+
+
+@task_app.command("list")
+def task_list(
+    status: list[TaskStatus] | None = typer.Option(None, "--status"),
+    since: datetime | None = typer.Option(None, "--since"),
+    limit: int = typer.Option(50, min=1, max=100),
+) -> None:
+    """List bounded queue state without reading SQLite manually."""
+    tasks = TaskStore().list_tasks(statuses=set(status or []), since=since, limit=limit)
+    typer.echo(json.dumps([
+        {
+            "task_id": task.id,
+            "status": task.status.value,
+            "created_at": task.created_at.isoformat(),
+            "current_subgoal": task.current_subgoal,
+            "failure_reason": task.failure_reason,
+            "worker_id": task.worker_id,
+        }
+        for task in tasks
+    ], indent=2))
+
+
+@task_app.command("retry")
+def task_retry(task_id: str) -> None:
+    """Retry a failed task only if no Android mutation began."""
+    try:
+        task = TaskStore().retry_task(task_id)
+    except ValueError as error:
+        raise typer.BadParameter(str(error)) from error
     typer.echo(f"{task.id}\t{task.status.value}")
 
 

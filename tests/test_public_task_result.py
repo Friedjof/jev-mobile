@@ -54,6 +54,27 @@ def test_unverifiable_task_never_claims_verified_success() -> None:
     }
 
 
+def test_unknown_internal_failure_is_exposed_as_stable_agent_bug() -> None:
+    task = MobileTask(
+        id="task-agent-bug",
+        instruction="do something",
+        task_spec=TaskSpec(),
+        created_at=datetime.now(UTC),
+        status=TaskStatus.FAILED,
+        failure_reason="Jev selected an invalid action",
+    )
+
+    assert _public_result(task) == {
+        "status": "failed",
+        "failure": {
+            "category": "AGENT_BUG",
+            "reason": "JEV SELECTED AN INVALID ACTION",
+            "message": "Jev selected an invalid action",
+            "recoverable": False,
+        },
+    }
+
+
 def test_public_success_contains_only_safe_evidence_and_explicit_observations() -> None:
     task = MobileTask(
         id="task-result",

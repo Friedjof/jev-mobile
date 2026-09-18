@@ -31,6 +31,7 @@ from .device.portal_adb import PortalAdbDeviceAdapter
 from .agent.mobile_agent import MobileAgent
 from .requirements.generators import generate_requirements
 from .task_store import TaskStatus, TaskStore
+from .failures import classify_failure
 from .tasks import (
     AnswerEffect,
     AnswerEffectKind,
@@ -112,11 +113,15 @@ def _agent(backend: Backend, provider: ProviderName, settings: Settings, serial:
 
 
 @server.tool(name="start_task", description="Delegate a high-level mobile task. Returns immediately; the durable worker executes it.")
-async def start_task(instruction: str, subtasks: SubtaskRequestList | None = None) -> dict[str, object]:
+async def start_task(
+    instruction: str,
+    subtasks: SubtaskRequestList | None = None,
+    idempotency_key: str | None = None,
+) -> dict[str, object]:
     spec = task_spec_from_goal(instruction)
     ordered_subtasks = build_ordered_subtasks(subtasks)
     # A separate durable worker claims queued tasks. MCP never owns device execution.
-    task = _task_store.create(instruction, spec, ordered_subtasks)
+    task = _task_store.create(instruction, spec, ordered_subtasks, idempotency_key=idempotency_key)
     return {"task_id": task.id, "status": task.status.value}
 
 
@@ -315,51 +320,16 @@ def _question_spec(payload: dict[str, object]) -> QuestionSpec:
 def _public_result(task) -> dict[str, object] | None:
     if not task.result:
         if task.status == TaskStatus.FAILED:
-            if task.failure_reason in {"NO_VERIFIABLE_COMPLETION_CRITERIA", "TASK_CONTRACT_INCOMPLETE"}:
-                return {
-                    "status": "failed",
-                    "failure": {
-                        "category": "UNSUPPORTED_TASK",
-                        "reason": task.failure_reason,
-                        "message": (
-                            "The task could not be executed because it has no observable completion criteria."
-                            if task.failure_reason == "NO_VERIFIABLE_COMPLETION_CRITERIA"
-                            else "The task could not be converted into a complete, safe execution contract."
-                        ),
-                        "recoverable": True,
-                    },
-                }
-            if task.failure_reason == "ORIENTATION_BLOCKED_BY_PERSISTED_APP_STATE":
-                return {
-                    "status": "failed",
-                    "failure": {
-                        "category": "SAFETY_BLOCKED",
-                        "reason": "PERSISTED_FOREIGN_APP_STATE",
-                        "message": "The target app persistently restores unrelated content. Continuing would require destructive application-state reset.",
-                        "recoverable": False,
-                    },
-                }
-            if task.failure_reason == "ORIENTATION_BLOCKED_BY_USER_DENIAL":
-                return {
-                    "status": "failed",
-                    "failure": {
-                        "category": "SAFETY_BLOCKED",
-                        "reason": "USER_DENIED_RECOVERY",
-                        "message": "The requested recovery operation was denied; no Android action was executed.",
-                        "recoverable": False,
-                    },
-                }
-            if task.failure_reason == "SENSITIVE_INFORMATION_DENIED":
-                return {
-                    "status": "failed",
-                    "failure": {
-                        "category": "SAFETY_BLOCKED",
-                        "reason": "USER_DENIED_INFORMATION_DISCLOSURE",
-                        "message": "The requested personal information was not read or returned.",
-                        "recoverable": False,
-                    },
-                }
-            return {"status": "failed", "failure": {"category": "AGENT", "message": task.failure_reason or "Task failed", "recoverable": False}}
+            failure = classify_failure(task.failure_reason)
+            return {
+                "status": "failed",
+                "failure": {
+                    "category": failure.category.value,
+                    "reason": failure.reason,
+                    "message": failure.message,
+                    "recoverable": failure.recoverable,
+                },
+            }
         return None
     if task.subtasks:
         return _public_subtask_result(task)
@@ -587,10 +557,12 @@ async def get_device_status(serial: str | None = None, backend: Backend = "porta
     settings = Settings.from_env()
     selected_serial = serial or settings.device_serial
     if not selected_serial:
-        return {"connected": False, "backend": backend, "reason": "no configured device serial"}
+        return {"connected": False, "backend": backend, "device_serial": None, "status_timestamp": None,
+                "reason": "no configured device serial"}
     status = _task_store.get_device_status(selected_serial)
     if not status:
-        return {"connected": False, "backend": backend, "reason": "worker has not published device status"}
+        return {"connected": False, "backend": backend, "device_serial": selected_serial, "status_timestamp": None,
+                "reason": "worker has not published device status"}
     return {"connected": bool(status.get("device_available")), "backend": backend, **status}
 
 
@@ -694,7 +666,7 @@ async def mobile_agent_run(
         "status": result.status.value,
         "task_id": result.task_id,
         "message": result.message,
-        "trace_path": str(trace.path),
+        **({"trace_path": str(trace.path)} if trace.path.exists() else {}),
     }
 
 
@@ -705,7 +677,7 @@ class _McpHttpSecurityMiddleware(BaseHTTPMiddleware):
         super().__init__(app); self.origins, self.bearer_token = origins, bearer_token
 
     async def dispatch(self, request: Request, call_next):
-        if request.url.path != "/health":
+        if request.url.path not in {"/health", "/ready"}:
             origin = request.headers.get("origin")
             if origin and origin not in self.origins:
                 return JSONResponse({"error": "origin not allowed"}, status_code=403)
@@ -718,6 +690,29 @@ async def _health(_: Request) -> JSONResponse:
     return JSONResponse({"ok": TaskStore().healthcheck()})
 
 
+async def _ready(_: Request) -> JSONResponse:
+    """Report worker/device readiness separately from MCP process liveness."""
+    settings = Settings.from_env()
+    serial = settings.device_serial
+    if not serial:
+        return JSONResponse({"ready": False, "reason": "no configured device serial"}, status_code=503)
+    status = TaskStore().get_device_status(serial)
+    if not status:
+        return JSONResponse({"ready": False, "device_serial": serial, "reason": "missing worker telemetry"}, status_code=503)
+    timestamp = status.get("status_timestamp")
+    try:
+        age_seconds = (datetime.now(UTC) - datetime.fromisoformat(str(timestamp))).total_seconds()
+    except (TypeError, ValueError):
+        age_seconds = float("inf")
+    ready = bool(status.get("worker_ready")) and age_seconds <= 45
+    return JSONResponse(
+        {"ready": ready, "device_serial": serial, "status_timestamp": timestamp,
+         "telemetry_age_seconds": round(age_seconds, 1) if age_seconds != float("inf") else None,
+         "readiness_category": status.get("readiness_category")},
+        status_code=200 if ready else 503,
+    )
+
+
 def run_streamable_http(host: str, port: int) -> None:
     """Serve the same six-tool MCP instance as stateless Streamable HTTP."""
     allowed_hosts = {item.strip() for item in os.getenv("JEV_MOBILE_MCP_ALLOWED_HOSTS", "jev-mobile-mcp,localhost,127.0.0.1").split(",") if item.strip()}
@@ -728,6 +723,7 @@ def run_streamable_http(host: str, port: int) -> None:
     json_response = os.getenv("JEV_MOBILE_MCP_JSON_RESPONSE", "true").casefold() in {"1", "true", "yes"}
     app = server.streamable_http_app(streamable_http_path="/mcp", json_response=json_response, stateless_http=True, host=host)
     app.router.routes.append(Route("/health", _health, methods=["GET"]))
+    app.router.routes.append(Route("/ready", _ready, methods=["GET"]))
     app.add_middleware(_McpHttpSecurityMiddleware, origins=allowed_origins, bearer_token=os.getenv("JEV_MOBILE_MCP_BEARER_TOKEN") or None)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(allowed_hosts))
     uvicorn.run(app, host=host, port=port, log_level="info")

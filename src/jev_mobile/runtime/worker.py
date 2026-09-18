@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 import signal
 import time
 from uuid import uuid4
 
 from ..agent.mobile_agent import MobileAgent
+from ..failures import classify_failure
+from ..operations import operational_event
 from ..task_store import TaskStatus, TaskStore
+from ..tracing.trace import TraceWriter
 from .readiness import RuntimeReadinessError, validate_adb_runtime
 
 
@@ -18,8 +22,20 @@ class DurableWorker:
         self._stopping = False
         self._last_device_status_at = 0.0
         self._ready = False
+        self._last_reported_ready: bool | None = None
 
     async def run_forever(self) -> None:
+        operational_event("worker_started", worker_id=self.worker_id, device_serial=self.serial)
+        retention_days = getattr(self.agent.settings, "event_retention_days", 30)
+        trace_retention_days = getattr(self.agent.settings, "trace_retention_days", 30)
+        if retention_days:
+            removed = self.store.prune_completed_events(datetime.now(UTC) - timedelta(days=retention_days))
+            operational_event("event_retention_applied", removed=removed, retention_days=retention_days)
+        if trace_retention_days:
+            removed = TraceWriter.prune(
+                self.agent.settings.trace_dir, datetime.now(UTC) - timedelta(days=trace_retention_days),
+            )
+            operational_event("trace_retention_applied", removed=removed, retention_days=trace_retention_days)
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             try: loop.add_signal_handler(sig, self.stop)
@@ -33,6 +49,7 @@ class DurableWorker:
             # Graceful shutdown does not fail a task; it makes its persisted
             # checkpoint immediately recoverable by the replacement worker.
             self.store.release_worker(self.worker_id)
+            operational_event("worker_stopped", worker_id=self.worker_id, device_serial=self.serial)
 
     async def run_once(self) -> bool:
         """Probe readiness and execute at most one task.
@@ -49,6 +66,7 @@ class DurableWorker:
         task = self.store.claim_next_task(self.worker_id, self.serial)
         if not task:
             return False
+        operational_event("task_claimed", task_id=task.id, worker_id=self.worker_id, device_serial=self.serial)
         await self._run_claimed(task.id)
         return True
 
@@ -60,6 +78,21 @@ class DurableWorker:
             if task and task.status == TaskStatus.RUNNING: self.store.heartbeat(task); self.store.event(task_id, "WORKER_HEARTBEAT", {}, self.worker_id, self.serial)
         await running
         task = self.store.get(task_id)
+        if task:
+            fields: dict[str, object] = {
+                "task_id": task.id,
+                "worker_id": self.worker_id,
+                "device_serial": self.serial,
+                "status": task.status.value,
+            }
+            if task.status == TaskStatus.FAILED:
+                failure = classify_failure(task.failure_reason)
+                fields.update(
+                    category=failure.category.value,
+                    reason=failure.reason,
+                    recoverable=failure.recoverable,
+                )
+            operational_event(f"task_{task.status.value}", **fields)
         if task and task.status in {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELLED}:
             # Terminal tasks leave the phone in a neutral state for the next
             # independent request. HOME is non-destructive and deliberately
@@ -129,6 +162,16 @@ class DurableWorker:
                 # claim work on the failed probe.
                 pass
             self._ready = False
+        if self._last_reported_ready != self._ready:
+            operational_event(
+                "device_connected" if self._ready else "device_disconnected",
+                worker_id=self.worker_id,
+                device_serial=self.serial,
+                category="READY" if self._ready else category,
+            )
+            if self._ready:
+                operational_event("worker_ready", worker_id=self.worker_id, device_serial=self.serial)
+            self._last_reported_ready = self._ready
         return self._ready
 
     def stop(self) -> None: self._stopping = True

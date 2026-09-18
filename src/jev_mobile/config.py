@@ -63,6 +63,8 @@ class Settings:
     bridge_port: int = 8765
     bridge_token: str | None = None
     text_input_strategy: str = "accessibility"
+    event_retention_days: int = 30
+    trace_retention_days: int = 30
     configuration_errors: tuple[str, ...] = ()
 
     @classmethod
@@ -110,5 +112,7 @@ class Settings:
             bridge_port=int(os.getenv("JEV_MOBILE_BRIDGE_PORT", "8765")),
             bridge_token=os.getenv("JEV_MOBILE_BRIDGE_TOKEN") or None,
             text_input_strategy=text_input_strategy,
+            event_retention_days=max(0, int(os.getenv("JEV_MOBILE_EVENT_RETENTION_DAYS", "30"))),
+            trace_retention_days=max(0, int(os.getenv("JEV_MOBILE_TRACE_RETENTION_DAYS", "30"))),
             configuration_errors=tuple(error for error in (typesafe_error,) if error),
         )

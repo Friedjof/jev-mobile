@@ -119,13 +119,37 @@ uv run jev-mobile worker --backend portal-adb --serial YOUR_ANDROID_SERIAL
 
 # Queue and inspect a durable task.
 uv run jev-mobile task start "Create a Google Keep note titled Test with body Hello World"
+uv run jev-mobile task start --idempotency-key parent-request-123 "Create a Google Keep note titled Test"
 uv run jev-mobile task get TASK_ID
 uv run jev-mobile task events TASK_ID
+uv run jev-mobile task list --status queued --status failed --limit 50
+uv run jev-mobile task retry TASK_ID  # rejected if any Android mutation began
 uv run jev-mobile task cancel TASK_ID
 
 # Worker health is independent from device availability.
 uv run jev-mobile health
 ```
+
+`start_task` accepts the same optional `idempotency_key`; repeating an identical
+request returns the original task ID, while reusing the key for different input
+is rejected. Queue listing and safety-checked retry are operator CLI commands,
+so the public MCP contract remains exactly the six high-level delegation tools.
+
+### Operations and readiness
+
+The worker emits secret-redacted JSON events to stdout/stderr for lifecycle,
+device availability, task claims/results, recovery and provider latency. Durable
+task events remain in SQLite. `jev-mobile health` and the MCP HTTP `/health`
+endpoint are liveness checks only: an unplugged phone does not make the process
+unhealthy. MCP HTTP `/ready` additionally requires worker telemetry no older
+than 45 seconds plus a ready device/backend/provider probe.
+
+Completed task events and JSONL traces are retained for 30 days by default.
+Set `JEV_MOBILE_EVENT_RETENTION_DAYS` or `JEV_MOBILE_TRACE_RETENTION_DAYS` to a
+different positive day count; `0` disables the corresponding automatic prune.
+Public failures use stable categories (`DEVICE_UNAVAILABLE`,
+`BACKEND_UNAVAILABLE`, `PROVIDER_UNAVAILABLE`, `UNSUPPORTED_TASK`,
+`SAFETY_BLOCKED`, or `AGENT_BUG`) and state whether retry may be appropriate.
 
 ### Alternative Android backends
 

@@ -11,6 +11,7 @@ from ..actions.models import ActionKind, ActionRisk, CandidateAction
 from ..actions.mutation_engine import MutationEngine
 from ..actions.mutation_family import MutationFamily
 from ..actions.mutation_journal import MutationJournal, MutationOutcome
+from ..operations import operational_event
 from ..config import Settings
 from ..device.adapter import DeviceAdapter
 from ..perception import ActionCatalog, SnapshotRefRegistry
@@ -89,7 +90,8 @@ class MobileAgent:
         persistence_list_seen = False
         base_step = task.step_number
         base_subtask_step = subtask.step_number if subtask else 0
-        trace = TraceWriter(self.settings.trace_dir)
+        trace = TraceWriter(self.settings.trace_dir, task.id)
+        trace.write(event="task_started", status=task.status.value, checkpoint_version=task.checkpoint_version)
         try:
             async with self.device_factory() as device:
                 for step in range(1, self.settings.max_steps + 1):
@@ -306,7 +308,16 @@ class MobileAgent:
                         task.status = TaskStatus.RECOVERING; task.failure_reason = str(error)
                         task.lease_expires_at = datetime.fromtimestamp(time.time() + 20, UTC)
                         self._save(task); self.store.event(task.id, "RECOVERY_STARTED", {"category": "JEV_DECISION", "reason": str(error), "subtask_id": subtask.id if subtask else None})
+                        operational_event(
+                            "provider_unavailable", task_id=task.id, worker_id=task.worker_id,
+                            category="PROVIDER_UNAVAILABLE", provider=getattr(self.provider, "name", type(self.provider).__name__),
+                        )
                         return
+                    operational_event(
+                        "provider_decision", task_id=task.id, worker_id=task.worker_id,
+                        provider=getattr(self.provider, "name", type(self.provider).__name__),
+                        duration_ms=round((time.monotonic() - started) * 1000, 1),
+                    )
                     selected = next((a for a in candidates if a.id == decision.action_id), None)
                     if selected is None: raise RuntimeError("Jev selected an invalid action")
                     self.store.event(task.id, "ACTION_SELECTED", {
@@ -603,6 +614,11 @@ class MobileAgent:
                     "reason": str(error),
                     "subtask_id": subtask.id if subtask else None,
                 }, task.worker_id)
+                operational_event(
+                    "provider_unavailable", task_id=task.id, worker_id=task.worker_id,
+                    category="PROVIDER_UNAVAILABLE", provider=getattr(self.provider, "name", type(self.provider).__name__),
+                    phase="task_interpretation",
+                )
                 return None
         if interpretation is not None:
             proposed = interpretation.to_task_spec()
@@ -689,7 +705,7 @@ class MobileAgent:
                 if requirement.required
             ],
             "steps": step,
-            "trace_path": str(trace.path),
+            **({"trace_path": str(trace.path)} if trace.path.exists() else {}),
         }
 
     @staticmethod
