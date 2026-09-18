@@ -36,7 +36,14 @@ _PROHIBITED_TERMS = ("password", "passwort", "token", "secret", "api key", "auth
 
 def _text(element: SemanticElement) -> str:
     return " ".join(
-        part for part in (element.label, element.value, element.state_description, element.hint) if part
+        part for part in (
+            element.field_name,
+            element.accessible_label,
+            element.hint,
+            element.label,
+            element.value,
+            element.state_description,
+        ) if part
     ).strip()
 
 
@@ -86,7 +93,16 @@ def extract_information(
     labels = [element for element in visible if _hint_score(_text(element), request.semantic_hints) >= 0.5]
     candidates: list[InformationCandidate] = []
     for label_element in labels:
-        label = label_element.label or label_element.field_name or request.question
+        # Editable controls commonly expose their current value as text and
+        # their semantic name through hint/contentDescription. The field name
+        # is the evidence label; the entered text remains the observed value.
+        label = (
+            label_element.field_name
+            or label_element.accessible_label
+            or label_element.hint
+            or label_element.label
+            or request.question
+        )
         direct = _candidate(request, label, label_element, 0.98)
         if direct:
             candidates.append(direct)

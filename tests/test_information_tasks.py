@@ -57,6 +57,26 @@ def test_visible_sibling_label_value_is_observed_with_source() -> None:
     assert match.candidate.confidence >= 0.9
 
 
+def test_editable_field_uses_semantic_name_and_current_value_as_evidence() -> None:
+    request = InformationRequest(
+        key="body", question="What is the body?", semantic_hints=["body"],
+    )
+    state = normalize(RawDeviceState(package="io.example.fixture", elements=[
+        RawDeviceElement(
+            node_id="body", text="DoNotModify", content_description="Body",
+            hint="Body", editable=True, class_name="android.widget.EditText",
+        ),
+    ]))
+
+    match = extract_information(request, state)
+
+    assert match.status == InformationMatchStatus.OBSERVED
+    assert match.candidate is not None
+    assert match.candidate.label == "Body"
+    assert match.candidate.value == "DoNotModify"
+    assert match.candidate.semantic_role == "body"
+
+
 def test_multiple_observed_values_require_structured_selection() -> None:
     request = InformationRequest(
         key="device_name", question="What is the device name?", semantic_hints=["device name"],
