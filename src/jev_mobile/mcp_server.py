@@ -8,6 +8,7 @@ candidate action before a provider can choose it.
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import UTC, datetime
 from typing import Literal
 
 from mcp.server.mcpserver import MCPServer
@@ -117,14 +118,21 @@ async def get_task_events(task_id: str, after_seq: int = 0) -> dict[str, object]
     return {"task_id": task_id, "events": [_public_event(event) for event in events], "next_after_seq": events[-1]["seq"] if events else after_seq}
 
 
-@server.tool(name="cancel_task", description="Cancel a queued or running high-level mobile task.")
+@server.tool(name="cancel_task", description="Cancel a queued, running, or waiting high-level mobile task.")
 async def cancel_task(task_id: str) -> dict[str, object]:
     task = _task_store.get(task_id)
     if not task: raise ValueError("unknown task_id")
     if task.status not in {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELLED}:
         task.cancellation_requested = True
+        if task.status == TaskStatus.WAITING_FOR_USER:
+            # There is no worker claim while waiting, hence no active mutation
+            # to resolve.  Finish the cancellation durably instead of leaving
+            # an abandoned approval request indefinitely waiting.
+            task.status, task.finished_at = TaskStatus.CANCELLED, datetime.now(UTC)
         _task_store.save(task)
         _task_store.event(task.id, "TASK_CANCELLATION_REQUESTED", {})
+        if task.status == TaskStatus.CANCELLED:
+            _task_store.event(task.id, "TASK_CANCELLED", {})
     return {"task_id": task.id, "status": task.status.value, "cancellation_requested": task.cancellation_requested}
 
 

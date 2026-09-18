@@ -13,3 +13,4 @@ android/jev-mobile-test-app/build/
 jev-mobile-tasks.sqlite3
 jev-mobile-tasks.sqlite3-shm
 jev-mobile-tasks.sqlite3-wal
+.benchmark/

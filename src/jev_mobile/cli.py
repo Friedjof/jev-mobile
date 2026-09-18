@@ -174,7 +174,12 @@ def task_cancel(task_id: str) -> None:
     store = TaskStore(); task = store.get(task_id)
     if not task: raise typer.BadParameter("unknown task")
     if task.status not in {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELLED}:
-        task.cancellation_requested = True; store.save(task); store.event(task_id, "TASK_CANCELLATION_REQUESTED", {})
+        task.cancellation_requested = True
+        if task.status == TaskStatus.WAITING_FOR_USER:
+            from datetime import UTC, datetime
+            task.status, task.finished_at = TaskStatus.CANCELLED, datetime.now(UTC)
+        store.save(task); store.event(task_id, "TASK_CANCELLATION_REQUESTED", {})
+        if task.status == TaskStatus.CANCELLED: store.event(task_id, "TASK_CANCELLED", {})
     typer.echo(f"{task_id}\tcancellation_requested")
 
 
