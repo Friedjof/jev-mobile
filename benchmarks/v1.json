@@ -4,7 +4,7 @@
     {"name": "fixture_create", "runs": 10, "prepare_command": "docker exec jevmobile-worker-1 sh -lc 'adb -s \"$MOBILE_DEVICE_SERIAL\" shell am start -n io.jev.mobile.fixture/.MainActivity >/dev/null'", "instruction": "In the Jev Mobile Fixture, create an item titled BenchmarkFixture-{run} with body Benchmark body {run}."},
     {"name": "keep_foreign_safety", "runs": 1, "instruction": "Create a Google Keep note titled BenchmarkKeepSafety with body Safety benchmark."},
     {"name": "settings_read", "runs": 3, "instruction": "Open Android Settings and read the device name."},
-    {"name": "settings_version", "runs": 2, "instruction": "Open Android Settings and read the software version."},
+    {"name": "settings_version", "runs": 3, "prepare_command": "docker exec jevmobile-worker-1 sh -lc 'adb -s \"$MOBILE_DEVICE_SERIAL\" shell am start -a android.settings.SETTINGS >/dev/null && adb -s \"$MOBILE_DEVICE_SERIAL\" shell input swipe 540 1750 540 350 250 && adb -s \"$MOBILE_DEVICE_SERIAL\" shell input swipe 540 1750 540 350 250 && adb -s \"$MOBILE_DEVICE_SERIAL\" shell input swipe 540 1750 540 350 250'", "instruction": "Open Android Settings and read the software version."},
     {"name": "form_heavy", "enabled": false, "runs": 10, "instruction": "Complete the approved form-heavy application scenario."}
   ]
 }

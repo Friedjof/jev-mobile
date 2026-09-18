@@ -253,7 +253,15 @@ class MobileAgent:
                         task.status = TaskStatus.SUCCEEDED
                         task.result = self._verified_result(task, requirements, step, trace)
                         break
-                    context = before.model_copy(update={"agent_context": {"task_spec": task.task_spec.model_dump(mode="json"), "current_subgoal": task.current_subgoal, "requirements": {r.key: r.status.value for r in requirements}, "history": history[-6:]}})
+                    context = before.model_copy(update={
+                        "recent_context": history[-10:],
+                        "agent_context": {
+                            "task_spec": task.task_spec.model_dump(mode="json"),
+                            "current_subgoal": task.current_subgoal,
+                            "requirements": {r.key: r.status.value for r in requirements},
+                            "loop_status": self._loop_status(history, before.fingerprint),
+                        },
+                    })
                     input_question = self._ambiguity_question(task, requirements)
                     candidates, mapping = self._candidates(
                         catalog, refs, requirements, task.task_spec, before.app, history,
@@ -302,6 +310,21 @@ class MobileAgent:
                         task.agent_context["entity_ownership"] = EntityOwnership.CURRENT_TASK.value
                     task.pending_mutation = None; self.store.save(task); self.store.event(task.id, "MUTATION_RESOLVED", {"id": entry.id, "outcome": entry.outcome.value})
                     signature = self._attempt_signature(action, catalog_target)
+                    after = engine.last_observation
+                    requirement_before = {r.key: r.status.value for r in requirements}
+                    requirement_after = requirement_before
+                    if after is not None:
+                        post_requirements = evaluator.evaluate(
+                            task.task_spec,
+                            after,
+                            selections if isinstance(selections, dict) else None,
+                        )
+                        requirement_after = {r.key: r.status.value for r in post_requirements}
+                    progressed = sorted(
+                        key for key, status in requirement_after.items()
+                        if status == RequirementStatus.SATISFIED.value
+                        and requirement_before.get(key) != RequirementStatus.SATISFIED.value
+                    )
                     history.append({
                         "state": before.fingerprint,
                         "to_state": entry.post_state_fingerprint,
@@ -311,13 +334,27 @@ class MobileAgent:
                         "family": family.value,
                         "mutation": entry.outcome.value,
                         "requirements": tuple(sorted((r.key, r.status.value) for r in requirements)),
+                        "before": self._history_state(before),
+                        "after": self._history_state(after) if after is not None else None,
+                        "semantic_state_changed": bool(
+                            after is not None and after.fingerprint != before.fingerprint
+                        ),
+                        "requirement_progress": progressed,
+                        "target": {
+                            "role": catalog_target.role,
+                            "semantic_role": catalog_target.semantic_role,
+                            "label": catalog_target.label,
+                        } if catalog_target is not None else None,
                     })
-                    if self._navigation_cycle(history):
-                        history[-1]["cycle"] = True
+                    cycle_length = self._semantic_cycle_length(history)
+                    if cycle_length:
+                        for edge in history[-cycle_length:]:
+                            edge["cycle"] = True
                         self.store.event(task.id, "NAVIGATION_OSCILLATION", {
                             "from_state": before.fingerprint,
                             "to_state": entry.post_state_fingerprint,
                             "action_signature": signature,
+                            "cycle_length": cycle_length,
                         }, task.worker_id)
                         self.store.event(task.id, "RECOVERY_STARTED", {
                             "category": "NAVIGATION_OSCILLATION",
@@ -586,12 +623,20 @@ class MobileAgent:
 
     @staticmethod
     def _navigation_cycle(history: list[dict[str, object]]) -> bool:
+        """Compatibility predicate for semantic navigation/scroll cycles."""
+        return MobileAgent._semantic_cycle_length(history) is not None
+
+    @staticmethod
+    def _semantic_cycle_length(history: list[dict[str, object]]) -> int | None:
         """Detect semantic A→B→A and A→B→C→A without snapshot identity."""
         for length in (2, 3):
             if len(history) < length:
                 continue
             edges = history[-length:]
-            if any(edge.get("family") != MutationFamily.NAVIGATION.value for edge in edges):
+            if any(edge.get("family") not in {
+                MutationFamily.NAVIGATION.value,
+                MutationFamily.SCROLL.value,
+            } for edge in edges):
                 continue
             if any(edge.get("state") == edge.get("to_state") for edge in edges):
                 continue
@@ -600,8 +645,52 @@ class MobileAgent:
             states = [edges[0].get("state"), *[edge.get("to_state") for edge in edges]]
             same_requirements = len({repr(edge.get("requirements")) for edge in edges}) == 1
             if states[0] == states[-1] and len(set(states[:-1])) > 1 and same_requirements:
-                return True
-        return False
+                return length
+        return None
+
+    @staticmethod
+    def _history_state(state: SemanticState) -> dict[str, object]:
+        landmarks: list[str] = []
+        for element in state.elements:
+            if not element.visible or element.password:
+                continue
+            label = element.field_name or element.accessible_label or element.hint
+            if not label and not element.editable:
+                label = element.label
+            if label and label not in landmarks:
+                landmarks.append(label)
+            if len(landmarks) == 12:
+                break
+        return {
+            "package": state.app,
+            "screen": state.screen_hint,
+            "interaction_context": context_type(state).value,
+            "scroll_contexts": [item.model_dump(mode="json") for item in state.scroll_contexts],
+            "visible_landmarks": landmarks,
+            "dialog": state.dialog.kind.value if state.dialog else None,
+        }
+
+    @staticmethod
+    def _loop_status(history: list[dict[str, object]], current_state: str) -> dict[str, object]:
+        relevant = [
+            item for item in history[-10:]
+            if item.get("cycle") or item.get("mutation") == MutationOutcome.EXECUTED_NO_EFFECT.value
+        ]
+        return {
+            "detected": bool(relevant),
+            "current_state_has_suppressed_edge": any(
+                item.get("state") == current_state for item in relevant
+            ),
+            "recent_patterns": [
+                {
+                    "action": item.get("action"),
+                    "family": item.get("family"),
+                    "outcome": item.get("mutation"),
+                    "requirement_progress": item.get("requirement_progress", []),
+                }
+                for item in relevant[-4:]
+            ],
+        }
 
     @staticmethod
     def _read_navigation_allowed(item, spec: TaskSpec) -> bool:

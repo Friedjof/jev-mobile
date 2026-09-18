@@ -12,7 +12,16 @@ If the task contains explicit text, navigate to the correct editable field and e
 must be authored or inferred, choose ESCALATE rather than inventing it. Prefer safe, reversible navigation;
 never accept permissions, submit forms, send messages, buy anything, or change security settings. When a
 popup is visible, prefer a safe dismissal or Back. Choose ESCALATE whenever no listed action is clearly safe
-and useful."""
+and useful.
+
+Use recent action effects and requirement progress. A changed screen is not automatically task progress.
+Do not repeat an action that had no semantic effect. Do not repeat an A -> B -> A or A -> B -> C -> A
+transition without new evidence or requirement progress. Respect the reported scroll position and boundaries.
+
+General examples:
+- If a visible control directly relates to the unsatisfied requirement, prefer it over exploratory scrolling.
+- If an action left the semantic state and requirements unchanged, choose a different action family or target.
+- A one-time reversal may return to useful evidence, but do not repeat the same state cycle afterward."""
 
 
 def decision_policy(extra_policy: str | None = None) -> str:

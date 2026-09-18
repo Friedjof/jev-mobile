@@ -16,6 +16,7 @@ class MutationEngine:
     def __init__(self, registry: SnapshotRefRegistry, journal: MutationJournal,
                  observe: Callable[[], Awaitable[SemanticState]]) -> None:
         self.registry, self.journal, self.observe = registry, journal, observe
+        self.last_observation: SemanticState | None = None
 
     async def execute(self, action: str, target_ref: str, intended_effect: str,
                       operation: Callable[[str], Awaitable[object]],
@@ -36,9 +37,11 @@ class MutationEngine:
         except MutationOutcomeUnknown:
             # The required observation happens before any possible retry decision.
             state = await self.observe()
+            self.last_observation = state
             entry.post_state_fingerprint = state.fingerprint
             return self.journal.resolve_action(entry, MutationOutcome.EXECUTED_CONFIRMED if effect_observed(state) else MutationOutcome.EXECUTED_AMBIGUOUS)
         state = await self.observe()
+        self.last_observation = state
         entry.post_state_fingerprint = state.fingerprint
         self._fault("after_post_mutation_observe", entry, fault_callback)
         self._fault("before_mutation_resolve", entry, fault_callback)

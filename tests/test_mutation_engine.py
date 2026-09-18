@@ -23,6 +23,31 @@ async def test_stale_reference_does_not_execute_an_operation() -> None:
     assert not called
 
 
+async def test_engine_retains_post_action_semantic_observation() -> None:
+    registry = SnapshotRefRegistry()
+    before = normalize(RawDeviceState(elements=[
+        RawDeviceElement(node_id="one", text="One", clickable=True),
+    ]))
+    after = normalize(RawDeviceState(elements=[
+        RawDeviceElement(node_id="two", text="Two", clickable=True),
+    ]))
+    _, targets = registry.register(before)
+    target_ref = next(iter(targets))
+
+    async def operation(_: str):
+        return None
+
+    async def observe():
+        return after
+
+    engine = MutationEngine(registry, MutationJournal(), observe)
+    entry = await engine.execute("tap", target_ref, "open", operation, lambda _: True)
+
+    assert entry.outcome == MutationOutcome.EXECUTED_CONFIRMED
+    assert engine.last_observation is after
+    assert entry.post_state_fingerprint == after.fingerprint
+
+
 def test_family_filtered_fault_ignores_non_create_and_fires_once(monkeypatch) -> None:
     journal = MutationJournal()
     navigation = journal.begin_action(action="tap", snapshot_id="s1", intended_effect="back", family=MutationFamily.NAVIGATION)

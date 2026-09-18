@@ -60,6 +60,79 @@ def test_semantic_reverse_navigation_cycle_is_detected_and_edge_suppressed() -> 
     assert not any(item.kind.value == "tap" for item in actions)
 
 
+def test_scroll_reverse_and_three_state_cycles_are_detected() -> None:
+    requirements = (("read", "unsatisfied"),)
+    reverse = [
+        {"state": "bottom", "to_state": "middle", "family": "scroll", "requirements": requirements},
+        {"state": "middle", "to_state": "bottom", "family": "scroll", "requirements": requirements},
+    ]
+    longer = [
+        {"state": "A", "to_state": "B", "family": "navigation", "requirements": requirements},
+        {"state": "B", "to_state": "C", "family": "scroll", "requirements": requirements},
+        {"state": "C", "to_state": "A", "family": "navigation", "requirements": requirements},
+    ]
+
+    assert MobileAgent._semantic_cycle_length(reverse) == 2
+    assert MobileAgent._semantic_cycle_length(longer) == 3
+
+
+def test_cycle_suppression_is_scoped_to_semantic_source_state() -> None:
+    bottom = normalize(RawDeviceState(elements=[
+        RawDeviceElement(
+            node_id="list", text="Settings", scrollable=True,
+            available_actions=["SCROLL_BACKWARD"],
+        ),
+    ]))
+    registry = SnapshotRefRegistry()
+    catalog = ActionCatalog.build(bottom, registry)
+    scroll = type("A", (), {"kind": ActionKind.SCROLL_UP, "text": None})()
+    signature = MobileAgent._attempt_signature(scroll, catalog.actions[0])
+    history = [{
+        "signature": signature,
+        "state": bottom.fingerprint,
+        "mutation": "executed_confirmed",
+        "cycle": True,
+    }]
+
+    suppressed, _ = MobileAgent._candidates(
+        catalog, registry, [], type("S", (), {"app_package": None})(),
+        "x", history, bottom.fingerprint,
+    )
+    available_elsewhere, _ = MobileAgent._candidates(
+        catalog, registry, [], type("S", (), {"app_package": None})(),
+        "x", history, "materially-different-state",
+    )
+
+    assert not any(item.kind == ActionKind.SCROLL_UP for item in suppressed)
+    assert any(item.kind == ActionKind.SCROLL_UP for item in available_elsewhere)
+
+
+def test_model_history_contains_readable_scroll_and_loop_context() -> None:
+    state = normalize(RawDeviceState(package="com.android.settings", activity="Settings", elements=[
+        RawDeviceElement(
+            node_id="list", class_name="android.widget.ScrollView", scrollable=True,
+            available_actions=["SCROLL_BACKWARD"],
+        ),
+        RawDeviceElement(node_id="about", parent_id="list", text="About phone", clickable=True),
+    ]))
+
+    summary = MobileAgent._history_state(state)
+    loop = MobileAgent._loop_status([{
+        "state": state.fingerprint,
+        "action": "Scroll up",
+        "family": "scroll",
+        "mutation": "executed_confirmed",
+        "requirement_progress": [],
+        "cycle": True,
+    }], state.fingerprint)
+
+    assert summary["package"] == "com.android.settings"
+    assert summary["visible_landmarks"] == ["About phone"]
+    assert summary["scroll_contexts"][0]["position"] == "bottom"
+    assert loop["detected"] is True
+    assert loop["current_state_has_suppressed_edge"] is True
+
+
 def test_target_package_companion_is_same_app_context() -> None:
     assert MobileAgent._same_app_context("com.android.settings.intelligence", "com.android.settings")
     assert not MobileAgent._same_app_context("com.example.other", "com.android.settings")
