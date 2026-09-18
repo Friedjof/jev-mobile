@@ -10,7 +10,8 @@ on:
       - "uv.lock"
       - "Dockerfile"
       - "docker-compose.yml"
-      - "deploy/docker/**"
+      - "compose.production.yml"
+      - "deploy/**"
       - "android/jev-mobile-test-app/**"
       - ".dockerignore"
       - ".github/workflows/python-docker.yml"
@@ -22,7 +23,8 @@ on:
       - "uv.lock"
       - "Dockerfile"
       - "docker-compose.yml"
-      - "deploy/docker/**"
+      - "compose.production.yml"
+      - "deploy/**"
       - "android/jev-mobile-test-app/**"
       - ".dockerignore"
       - ".github/workflows/python-docker.yml"
@@ -63,6 +65,18 @@ jobs:
           assert names == {"start_task", "get_task", "get_task_events", "cancel_task", "answer_task", "get_device_status"}
           print("MCP tools:", ", ".join(sorted(names)))
           PY
+      - name: Validate production deployment artifacts
+        env:
+          JEV_MOBILE_ENV_FILE: deploy/docker/jev-mobile.env.example
+          JEV_MOBILE_MCP_ENV_FILE: deploy/docker/mcp.env.example
+          JEV_MOBILE_DATA_DIR: /tmp/jev-mobile-data
+          JEV_MOBILE_ADB_KEYS_DIR: /tmp/jev-mobile-adb
+          JEV_MOBILE_TYPESAFE_API_KEY_FILE: /tmp/typesafe-api-key
+          JEV_MOBILE_USB_GID: "46"
+          JEV_MOBILE_IMAGE: ghcr.io/friedjof/jev-mobile-mcp:0.1.2
+        run: |
+          docker compose -f compose.production.yml config --quiet
+          sh -n deploy/synology/jev-mobile-usb-hook
       - uses: docker/setup-buildx-action@v3
       - name: Log in to GitHub Container Registry
         if: github.event_name == 'push'

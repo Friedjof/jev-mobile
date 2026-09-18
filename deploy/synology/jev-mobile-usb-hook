@@ -1,0 +1,151 @@
+#!/bin/sh
+set -eu
+
+CONFIG=${JEV_MOBILE_USB_CONFIG:-/usr/local/etc/jev-mobile/usb-hook.env}
+HANDLER=${JEV_MOBILE_USB_HANDLER:-/usr/local/libexec/jev-mobile-usb-hook}
+RULE=${JEV_MOBILE_USB_RULE:-/etc/udev/rules.d/99-jev-mobile-android.rules}
+SYSFS_ROOT=${JEV_USB_SYSFS_ROOT:-/sys/bus/usb/devices}
+DEV_ROOT=${JEV_USB_DEV_ROOT:-/dev/bus/usb}
+DOCKER=${JEV_DOCKER_BIN:-docker}
+
+usage() {
+  echo "Usage: $0 --dry-run|--install|--verify|--rollback|--repair USB_DEVICE" >&2
+  echo "Install variables: JEV_USB_VENDOR_ID, JEV_USB_PRODUCT_ID, JEV_USB_SERIAL, JEV_USB_GROUP[, JEV_WORKER_CONTAINER]" >&2
+}
+
+validate_hex() {
+  case "$1" in
+    [0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]) ;;
+    *) echo "Expected a four-digit USB hex ID, got: $1" >&2; exit 2 ;;
+  esac
+}
+
+validate_scalar() {
+  case "$2" in
+    ""|*[!A-Za-z0-9_.:-]*) echo "Invalid $1: $2" >&2; exit 2 ;;
+  esac
+}
+
+load_config() {
+  [ -r "$CONFIG" ] || { echo "Missing config: $CONFIG" >&2; exit 2; }
+  # The installer writes only validated scalar values to this root-owned file.
+  # shellcheck disable=SC1090
+  . "$CONFIG"
+  : "${USB_VENDOR_ID:?}" "${USB_PRODUCT_ID:?}" "${ANDROID_SERIAL:?}" "${USB_GROUP:?}" "${WORKER_CONTAINER:?}"
+}
+
+device_node() {
+  device=$1
+  base="$SYSFS_ROOT/$device"
+  [ -r "$base/busnum" ] && [ -r "$base/devnum" ] || return 1
+  bus=$(printf '%03d' "$(sed 's/^0*//' "$base/busnum")")
+  dev=$(printf '%03d' "$(sed 's/^0*//' "$base/devnum")")
+  printf '%s/%s/%s\n' "$DEV_ROOT" "$bus" "$dev"
+}
+
+matches_device() {
+  base="$SYSFS_ROOT/$1"
+  [ -r "$base/idVendor" ] && [ -r "$base/idProduct" ] || return 1
+  vendor=$(tr 'A-F' 'a-f' < "$base/idVendor")
+  product=$(tr 'A-F' 'a-f' < "$base/idProduct")
+  [ "$vendor" = "$(printf '%s' "$USB_VENDOR_ID" | tr 'A-F' 'a-f')" ] &&
+    [ "$product" = "$(printf '%s' "$USB_PRODUCT_ID" | tr 'A-F' 'a-f')" ]
+}
+
+verify_adb() {
+  attempt=1
+  while [ "$attempt" -le "${ADB_VERIFY_ATTEMPTS:-8}" ]; do
+    state=$($DOCKER exec "$WORKER_CONTAINER" adb -s "$ANDROID_SERIAL" get-state 2>/dev/null || true)
+    [ "$state" = device ] && return 0
+    sleep "${ADB_VERIFY_DELAY_SECONDS:-2}"
+    attempt=$((attempt + 1))
+  done
+  echo "ADB did not recover for configured serial" >&2
+  return 1
+}
+
+repair() {
+  load_config
+  usb_device=$1
+  if ! matches_device "$usb_device"; then
+    echo "Ignoring non-matching USB device: $usb_device"
+    return 0
+  fi
+  node=$(device_node "$usb_device") || { echo "USB node not resolved for $usb_device" >&2; return 1; }
+  [ -e "$node" ] || { echo "USB node does not exist: $node" >&2; return 1; }
+  chgrp "$USB_GROUP" "$node"
+  chmod 0660 "$node"
+  $DOCKER restart "$WORKER_CONTAINER" >/dev/null
+  verify_adb
+  echo "Repaired $node and verified Android serial $ANDROID_SERIAL"
+}
+
+case "${1:-}" in
+  --dry-run)
+    : "${JEV_USB_VENDOR_ID:?}" "${JEV_USB_PRODUCT_ID:?}" "${JEV_USB_SERIAL:?}" "${JEV_USB_GROUP:?}"
+    validate_hex "$JEV_USB_VENDOR_ID"; validate_hex "$JEV_USB_PRODUCT_ID"
+    validate_scalar serial "$JEV_USB_SERIAL"
+    validate_scalar group "$JEV_USB_GROUP"
+    validate_scalar container "${JEV_WORKER_CONTAINER:-jev-mobile-worker}"
+    echo "Would install handler: $HANDLER"
+    echo "Would install udev rule: $RULE"
+    echo "Would match USB ${JEV_USB_VENDOR_ID}:${JEV_USB_PRODUCT_ID} only"
+    echo "Would grant group ${JEV_USB_GROUP} mode 0660 and restart ${JEV_WORKER_CONTAINER:-jev-mobile-worker}"
+    ;;
+  --install)
+    [ "$(id -u)" -eq 0 ] || { echo "--install requires root" >&2; exit 2; }
+    : "${JEV_USB_VENDOR_ID:?}" "${JEV_USB_PRODUCT_ID:?}" "${JEV_USB_SERIAL:?}" "${JEV_USB_GROUP:?}"
+    validate_hex "$JEV_USB_VENDOR_ID"; validate_hex "$JEV_USB_PRODUCT_ID"
+    validate_scalar serial "$JEV_USB_SERIAL"
+    validate_scalar group "$JEV_USB_GROUP"
+    validate_scalar container "${JEV_WORKER_CONTAINER:-jev-mobile-worker}"
+    getent group "$JEV_USB_GROUP" >/dev/null || { echo "Unknown group: $JEV_USB_GROUP" >&2; exit 2; }
+    install -d -m 0755 "$(dirname "$CONFIG")" "$(dirname "$HANDLER")" "$(dirname "$RULE")"
+    install -m 0755 "$0" "$HANDLER"
+    umask 077
+    {
+      printf "USB_VENDOR_ID='%s'\n" "$JEV_USB_VENDOR_ID"
+      printf "USB_PRODUCT_ID='%s'\n" "$JEV_USB_PRODUCT_ID"
+      printf "ANDROID_SERIAL='%s'\n" "$JEV_USB_SERIAL"
+      printf "USB_GROUP='%s'\n" "$JEV_USB_GROUP"
+      printf "WORKER_CONTAINER='%s'\n" "${JEV_WORKER_CONTAINER:-jev-mobile-worker}"
+    } > "$CONFIG"
+    printf 'ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="%s", ATTR{idProduct}=="%s", RUN+="%s --repair %%k"\n' \
+      "$JEV_USB_VENDOR_ID" "$JEV_USB_PRODUCT_ID" "$HANDLER" > "$RULE"
+    udevadm control --reload-rules
+    echo "Installed Jev Mobile USB reconnect hook"
+    ;;
+  --verify)
+    load_config
+    found=0
+    for vendor_file in "$SYSFS_ROOT"/*/idVendor; do
+      [ -e "$vendor_file" ] || continue
+      usb_device=$(basename "$(dirname "$vendor_file")")
+      if matches_device "$usb_device"; then
+        node=$(device_node "$usb_device")
+        mode=$(stat -c '%a' "$node")
+        group=$(stat -c '%G' "$node")
+        [ "$mode" = 660 ] && [ "$group" = "$USB_GROUP" ] || {
+          echo "Wrong permissions for $node: $group $mode" >&2; exit 1;
+        }
+        verify_adb
+        echo "Verified $node, container $WORKER_CONTAINER, serial $ANDROID_SERIAL"
+        found=1
+      fi
+    done
+    [ "$found" -eq 1 ] || { echo "Configured USB device not found" >&2; exit 1; }
+    ;;
+  --rollback)
+    [ "$(id -u)" -eq 0 ] || { echo "--rollback requires root" >&2; exit 2; }
+    [ -e "$RULE" ] && unlink "$RULE"
+    [ -e "$HANDLER" ] && unlink "$HANDLER"
+    [ -e "$CONFIG" ] && unlink "$CONFIG"
+    udevadm control --reload-rules
+    echo "Removed Jev Mobile USB reconnect hook"
+    ;;
+  --repair)
+    [ "$#" -eq 2 ] || { usage; exit 2; }
+    repair "$2"
+    ;;
+  *) usage; exit 2 ;;
+esac

@@ -342,6 +342,13 @@ checks its runtime and SQLite only. Device availability is exposed separately
 through `get_device_status`; an unplugged phone does not restart the worker.
 No service exposes ADB over TCP.
 
+For a release-pinned deployment without a repository checkout, use
+[`compose.production.yml`](compose.production.yml). It contains no build
+context, names the worker and MCP roles explicitly, applies read-only root
+filesystems/capability dropping/no-new-privileges, and publishes no port. The
+complete install, Synology USB reconnect, upgrade and rollback procedure is in
+[`docs/production-deployment.md`](docs/production-deployment.md).
+
 For an MCP parent that launches stdio servers, use the non-secret MCP role file
 and the same data directory, for example:
 

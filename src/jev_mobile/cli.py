@@ -5,8 +5,12 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from datetime import datetime
+from importlib.metadata import version as package_version
 import json
 import logging
+import os
+from pathlib import Path
+import stat as stat_module
 import typer
 from .actions.builder import build_action_page
 from .cli_output import RunReporter, console, render_actions, render_decision, render_result, render_state
@@ -85,6 +89,7 @@ def _device(backend: str, settings: Settings, serial: str | None):
 def doctor(
     serial: str | None = typer.Option(None),
     backend: str = typer.Option("portal-adb", "--backend"),
+    json_output: bool = typer.Option(False, "--json"),
 ) -> None:
     """Diagnose one backend without selecting a fallback transport."""
     async def command(*args: str) -> tuple[bool, str]:
@@ -97,11 +102,47 @@ def doctor(
         settings = Settings.from_env()
         nonlocal selected
         selected = serial or settings.device_serial
-        if not selected:
-            typer.echo("ERROR  serial is required", err=True); return 2
         checks: list[tuple[str, str, str]] = []
+        try:
+            store = TaskStore()
+            store_ok = store.healthcheck() and store.readinesscheck()
+            checks.append(("TaskStore", "OK" if store_ok else "ERROR", str(store.path.resolve())))
+        except Exception as error:
+            checks.append(("TaskStore", "ERROR", f"{type(error).__name__}: {error}"))
+        adb_key = (os.getenv("ADB_VENDOR_KEYS") or "").split(os.pathsep)[0]
+        if adb_key:
+            key_path = Path(adb_key)
+            checks.append(("ADB key", "OK" if key_path.is_file() and os.access(key_path, os.R_OK) else "ERROR",
+                           "configured and readable" if key_path.is_file() and os.access(key_path, os.R_OK) else "configured but unreadable"))
+        else:
+            checks.append(("ADB key", "WARNING", "ADB_VENDOR_KEYS is not configured"))
+        provider_ready = bool(settings.typesafe_api_key) and not settings.configuration_errors
+        checks.append(("Jev provider", "OK" if provider_ready else "ERROR",
+                       "credential configured" if provider_ready else "; ".join(settings.configuration_errors) or "credential missing"))
+        adb_socket = os.getenv("ADB_SERVER_SOCKET", "local")
+        checks.append(("ADB transport", "ERROR" if adb_socket.startswith("tcp:") else "OK",
+                       "TCP ADB is not permitted" if adb_socket.startswith("tcp:") else "local USB/default server"))
+        if not selected:
+            checks.append(("ADB device", "ERROR", "serial is required"))
+            return emit(checks)
         ok, output = await command("get-state")
         checks.append(("ADB device", "OK" if ok and output == "device" else "ERROR", output))
+        devpath_ok, devpath = await command("get-devpath")
+        usb_name = devpath.removeprefix("usb:") if devpath_ok else ""
+        sysfs = Path("/sys/bus/usb/devices") / usb_name
+        try:
+            bus = int((sysfs / "busnum").read_text().strip())
+            device = int((sysfs / "devnum").read_text().strip())
+            usb_node = Path(f"/dev/bus/usb/{bus:03d}/{device:03d}")
+            node_stat = usb_node.stat()
+            mode = stat_module.S_IMODE(node_stat.st_mode)
+            expected_gid = os.getenv("JEV_MOBILE_USB_GID")
+            accessible = os.access(usb_node, os.R_OK | os.W_OK)
+            group_matches = expected_gid is None or node_stat.st_gid == int(expected_gid)
+            checks.append(("USB permissions", "OK" if accessible and group_matches else "ERROR",
+                           f"{usb_node} mode={mode:04o} gid={node_stat.st_gid}"))
+        except (OSError, ValueError) as error:
+            checks.append(("USB permissions", "WARNING", f"node metadata unavailable: {type(error).__name__}"))
         if backend != "portal-adb":
             checks.append(("Backend", "WARNING", "only portal-adb has full local diagnostics"))
         ok, output = await command("shell", "pm", "path", "com.mobilerun.portal")
@@ -119,8 +160,26 @@ def doctor(
                            ("screenshot", "OK" if image.startswith(b"\x89PNG") else "WARNING", f"{len(image)} bytes")])
         except Exception as error:
             checks.append(("Portal runtime", "ERROR", str(error)))
-        for label, status, detail in checks: typer.echo(f"{status:<7} {label}: {detail}")
-        return 0 if not any(status == "ERROR" for _, status, _ in checks) else 2
+        return emit(checks)
+
+    def emit(checks: list[tuple[str, str, str]]) -> int:
+        success = not any(status == "ERROR" for _, status, _ in checks)
+        if json_output:
+            typer.echo(json.dumps({
+                "ok": success,
+                "version": package_version("jev-mobile"),
+                "backend": backend,
+                "device_serial": selected or None,
+                "database": str(Path(os.getenv("JEV_MOBILE_DB", "jev-mobile-tasks.sqlite3")).resolve()),
+                "checks": [
+                    {"name": label, "status": status.lower(), "detail": detail}
+                    for label, status, detail in checks
+                ],
+            }, indent=2))
+        else:
+            for label, status, detail in checks:
+                typer.echo(f"{status:<7} {label}: {detail}")
+        return 0 if success else 2
 
     selected = ""
     raise typer.Exit(asyncio.run(diagnose()))

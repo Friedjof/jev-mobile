@@ -1,0 +1,83 @@
+name: jev-mobile
+
+x-runtime-security: &runtime-security
+  user: "${JEV_MOBILE_UID:-1000}:${JEV_MOBILE_GID:-1000}"
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=64m
+  init: true
+
+services:
+  jev-mobile-worker:
+    <<: *runtime-security
+    image: ${JEV_MOBILE_IMAGE:?Set JEV_MOBILE_IMAGE to a pinned release tag, never latest}
+    container_name: jev-mobile-worker
+    command: ["worker", "--backend", "portal-adb"]
+    restart: unless-stopped
+    env_file:
+      - ${JEV_MOBILE_ENV_FILE:?Set JEV_MOBILE_ENV_FILE to the worker env file}
+    environment:
+      JEV_MOBILE_DB: /data/jev-mobile.db
+      TRACE_DIR: /data/traces
+      HOME: /home/jev
+      ANDROID_USER_HOME: /data/adb
+      ADB_VENDOR_KEYS: /data/adb/adbkey
+      JEV_MOBILE_USB_GID: ${JEV_MOBILE_USB_GID}
+      TYPESAFE_API_KEY_FILE: /run/secrets/typesafe_api_key
+    volumes:
+      - ${JEV_MOBILE_DATA_DIR:?Set JEV_MOBILE_DATA_DIR to a local directory}:/data:rw
+      - ${JEV_MOBILE_ADB_KEYS_DIR:?Set JEV_MOBILE_ADB_KEYS_DIR to the ADB key directory}:/data/adb:rw
+      - /dev/bus/usb:/dev/bus/usb:rw
+    secrets:
+      - typesafe_api_key
+    device_cgroup_rules:
+      - "c 189:* rmw"
+    group_add:
+      - "${JEV_MOBILE_USB_GID:?Set JEV_MOBILE_USB_GID to the USB device group ID}"
+    healthcheck:
+      test: ["CMD", "jev-mobile", "health"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 20s
+
+  jev-mobile-mcp:
+    <<: *runtime-security
+    image: ${JEV_MOBILE_IMAGE:?Set JEV_MOBILE_IMAGE to a pinned release tag, never latest}
+    container_name: jev-mobile-mcp
+    command: ["mcp", "--transport", "streamable-http", "--host", "0.0.0.0", "--port", "8851"]
+    restart: unless-stopped
+    env_file:
+      - ${JEV_MOBILE_MCP_ENV_FILE:?Set JEV_MOBILE_MCP_ENV_FILE to the MCP env file}
+    environment:
+      JEV_MOBILE_DB: /data/jev-mobile.db
+      HOME: /home/jev
+      JEV_MOBILE_MCP_ALLOWED_HOSTS: jev-mobile-mcp,localhost,127.0.0.1
+      JEV_MOBILE_MCP_JSON_RESPONSE: "false"
+    volumes:
+      - ${JEV_MOBILE_DATA_DIR:?Set JEV_MOBILE_DATA_DIR to a local directory}:/data:rw
+    expose:
+      - "8851"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8851/health').read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      openclaw-net:
+        aliases:
+          - jev-mobile-mcp
+
+secrets:
+  typesafe_api_key:
+    file: ${JEV_MOBILE_TYPESAFE_API_KEY_FILE:?Set JEV_MOBILE_TYPESAFE_API_KEY_FILE to the provider key file}
+
+networks:
+  openclaw-net:
+    external: true
+    name: ${JEV_MOBILE_OPENCLAW_NETWORK:-openclaw-net}
