@@ -12,8 +12,9 @@ from jev_mobile.tasks import CompletionRequirement, TaskSpec
 
 
 class _ProbeDevice:
-    def __init__(self, available: list[bool]) -> None:
+    def __init__(self, available: list[bool], home_calls: list[int]) -> None:
         self.available = available
+        self.home_calls = home_calls
 
     async def __aenter__(self) -> "_ProbeDevice":
         if not self.available[0]:
@@ -26,6 +27,9 @@ class _ProbeDevice:
     async def observe(self) -> RawDeviceState:
         return RawDeviceState(package="example.app", activity="Main", elements=[])
 
+    async def home(self) -> None:
+        self.home_calls[0] += 1
+
 
 class _CompletingAgent:
     def __init__(self, store: TaskStore, available: list[bool]) -> None:
@@ -34,9 +38,10 @@ class _CompletingAgent:
         self.settings = SimpleNamespace(configuration_errors=())
         self.provider = MockProvider()
         self.run_calls = 0
+        self.home_calls = [0]
 
     def device_factory(self) -> _ProbeDevice:
-        return _ProbeDevice(self.available)
+        return _ProbeDevice(self.available, self.home_calls)
 
     async def run(self, task_id: str) -> None:
         self.run_calls += 1
@@ -71,7 +76,33 @@ async def test_worker_leaves_task_queued_until_fresh_backend_probe_succeeds(tmp_
     completed = store.get(task.id)
     assert completed is not None and completed.status == TaskStatus.SUCCEEDED
     assert agent.run_calls == 1
+    assert agent.home_calls == [1]
+    assert store.events(task.id)[-1]["event_type"] == "TASK_RETURNED_HOME"
     assert store.get_device_status("phone-1")["worker_ready"] is True  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_worker_does_not_return_home_while_task_waits_for_user(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("ANDROID_USER_HOME", raising=False)
+    monkeypatch.delenv("ADB_VENDOR_KEYS", raising=False)
+    store = TaskStore(tmp_path / "tasks.sqlite3")
+    spec = TaskSpec(completion=[CompletionRequirement(type="app_open", value="example.app")])
+    task = store.create("open example", spec)
+    agent = _CompletingAgent(store, [True])
+
+    async def wait_for_user(task_id: str) -> None:
+        persisted = store.get(task_id)
+        assert persisted is not None
+        persisted.status = TaskStatus.WAITING_FOR_USER
+        store.save(persisted)
+
+    agent.run = wait_for_user  # type: ignore[method-assign]
+    worker = DurableWorker(store, agent, "phone-1")  # type: ignore[arg-type]
+
+    assert await worker.run_once() is True
+    waiting = store.get(task.id)
+    assert waiting is not None and waiting.status == TaskStatus.WAITING_FOR_USER
+    assert agent.home_calls == [0]
 
 
 @pytest.mark.asyncio

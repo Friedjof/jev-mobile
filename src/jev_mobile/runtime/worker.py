@@ -59,6 +59,22 @@ class DurableWorker:
             task = self.store.get(task_id)
             if task and task.status == TaskStatus.RUNNING: self.store.heartbeat(task); self.store.event(task_id, "WORKER_HEARTBEAT", {}, self.worker_id, self.serial)
         await running
+        task = self.store.get(task_id)
+        if task and task.status in {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELLED}:
+            # Terminal tasks leave the phone in a neutral state for the next
+            # independent request. HOME is non-destructive and deliberately
+            # runs outside Jev's selectable action space. A paused task must
+            # keep its current UI and therefore never enters this branch.
+            try:
+                async with self.agent.device_factory() as device:
+                    await device.home()
+                self.store.event(task_id, "TASK_RETURNED_HOME", {}, self.worker_id, self.serial)
+            except Exception as error:
+                # Cleanup failure cannot rewrite an already verified task
+                # result, but remains visible for operations and benchmarks.
+                self.store.event(task_id, "TASK_RETURN_HOME_FAILED", {
+                    "error": f"{type(error).__name__}: {error}",
+                }, self.worker_id, self.serial)
 
     async def _refresh_device_status(self, *, force: bool = False) -> bool:
         """Persist a read-only status snapshot for MCP-only processes.
