@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import shlex
 from collections.abc import Sequence
 
@@ -77,7 +78,8 @@ class StdioMcpClient:
 
 
 async def smoke(command: Sequence[str], instruction: str | None, task_id: str | None,
-                question_id: str | None, answer: str | None, cancel: bool) -> None:
+                question_id: str | None, answer: str | None, cancel: bool,
+                subtasks: list[dict[str, str]]) -> None:
     async with StdioMcpClient(command) as client:
         listed = await client.request("tools/list", {})
         names = {tool["name"] for tool in listed["tools"]}
@@ -87,7 +89,10 @@ async def smoke(command: Sequence[str], instruction: str | None, task_id: str | 
         device = await client.tool("get_device_status", {})
         print("device:", "connected" if device.get("connected") else "unavailable")
         if instruction:
-            started = await client.tool("start_task", {"instruction": instruction})
+            arguments: dict[str, object] = {"instruction": instruction}
+            if subtasks:
+                arguments["subtasks"] = subtasks
+            started = await client.tool("start_task", arguments)
             task_id = str(started["task_id"])
             print("started:", task_id, started["status"])
     if not task_id:
@@ -119,12 +124,26 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--command", default="docker compose run --rm -T mcp", help="stdio MCP command")
     parser.add_argument("--instruction")
+    parser.add_argument(
+        "--subtask", action="append", default=[], metavar="[ID=]INSTRUCTION",
+        help="ordered high-level subtask; may be repeated",
+    )
     parser.add_argument("--task-id")
     parser.add_argument("--question-id")
     parser.add_argument("--answer")
     parser.add_argument("--cancel", action="store_true")
     args = parser.parse_args()
-    asyncio.run(smoke(shlex.split(args.command), args.instruction, args.task_id, args.question_id, args.answer, args.cancel))
+    subtasks: list[dict[str, str]] = []
+    for value in args.subtask:
+        identifier, separator, instruction = value.partition("=")
+        if separator and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", identifier):
+            subtasks.append({"id": identifier, "instruction": instruction})
+        else:
+            subtasks.append({"instruction": value})
+    asyncio.run(smoke(
+        shlex.split(args.command), args.instruction, args.task_id,
+        args.question_id, args.answer, args.cancel, subtasks,
+    ))
 
 
 if __name__ == "__main__":

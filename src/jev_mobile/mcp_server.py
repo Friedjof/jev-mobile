@@ -11,6 +11,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 import argparse
 import os
+import re
 from typing import Literal
 
 from mcp.server.mcpserver import MCPServer
@@ -37,8 +38,11 @@ from .tasks import (
     QuestionOption,
     QuestionSpec,
     QuestionType,
+    SubtaskStatus,
+    SubtaskRequestList,
     TaskInputAnswer,
     apply_answer_effect,
+    build_ordered_subtasks,
     contract_status_for,
     task_spec_from_goal,
     validate_question_answer,
@@ -108,10 +112,11 @@ def _agent(backend: Backend, provider: ProviderName, settings: Settings, serial:
 
 
 @server.tool(name="start_task", description="Delegate a high-level mobile task. Returns immediately; the durable worker executes it.")
-async def start_task(instruction: str) -> dict[str, object]:
+async def start_task(instruction: str, subtasks: SubtaskRequestList | None = None) -> dict[str, object]:
     spec = task_spec_from_goal(instruction)
+    ordered_subtasks = build_ordered_subtasks(subtasks)
     # A separate durable worker claims queued tasks. MCP never owns device execution.
-    task = _task_store.create(instruction, spec)
+    task = _task_store.create(instruction, spec, ordered_subtasks)
     return {"task_id": task.id, "status": task.status.value}
 
 
@@ -120,6 +125,21 @@ async def get_task(task_id: str) -> dict[str, object]:
     task = _task_store.get(task_id)
     if not task: raise ValueError("unknown task_id")
     requirements = list(task.requirements.values())
+    subtask_items = [
+        {
+            "id": item.id,
+            "position": item.position,
+            "instruction": item.instruction,
+            "status": item.status.value,
+            "summary": item.result.get("summary") if item.result else None,
+            "failure_reason": item.failure_reason,
+        }
+        for item in task.subtasks
+    ]
+    current_subtask = next((item for item in subtask_items if item["id"] == task.active_subtask_id), None)
+    waiting_for_user = task.waiting_question or ({"text": task.waiting_reason} if task.waiting_reason else None)
+    if waiting_for_user and task.active_subtask_id:
+        waiting_for_user = {**waiting_for_user, "subtask_id": task.active_subtask_id}
     return {
         "task_id": task.id,
         "status": task.status.value,
@@ -127,7 +147,13 @@ async def get_task(task_id: str) -> dict[str, object]:
         "contract": _public_contract(task),
         "current_subgoal": task.current_subgoal,
         "progress": {"requirements_satisfied": sum(status.value == "satisfied" for status in requirements), "requirements_total": len(requirements)},
-        "waiting_for_user": task.waiting_question or ({"text": task.waiting_reason} if task.waiting_reason else None),
+        "subtasks": {
+            "completed": sum(item.status == SubtaskStatus.SUCCEEDED for item in task.subtasks),
+            "total": len(task.subtasks),
+            "current": current_subtask,
+            "items": subtask_items,
+        } if task.subtasks else None,
+        "waiting_for_user": waiting_for_user,
         "result": _public_result(task),
     }
 
@@ -146,14 +172,27 @@ async def cancel_task(task_id: str) -> dict[str, object]:
     if not task: raise ValueError("unknown task_id")
     if task.status not in {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELLED}:
         task.cancellation_requested = True
+        cancelled_subtasks = []
         if task.status == TaskStatus.WAITING_FOR_USER:
             # There is no worker claim while waiting, hence no active mutation
             # to resolve.  Finish the cancellation durably instead of leaving
             # an abandoned approval request indefinitely waiting.
             task.status, task.finished_at = TaskStatus.CANCELLED, datetime.now(UTC)
+            for subtask in task.subtasks:
+                if subtask.status in {
+                    SubtaskStatus.QUEUED, SubtaskStatus.RUNNING, SubtaskStatus.WAITING_FOR_USER,
+                }:
+                    subtask.status = SubtaskStatus.CANCELLED
+                    subtask.finished_at = task.finished_at
+                    cancelled_subtasks.append(subtask)
         _task_store.save(task)
         _task_store.event(task.id, "TASK_CANCELLATION_REQUESTED", {})
         if task.status == TaskStatus.CANCELLED:
+            for subtask in cancelled_subtasks:
+                _task_store.event(task.id, "SUBTASK_CANCELLED", {
+                    "subtask_id": subtask.id,
+                    "position": subtask.position,
+                })
             _task_store.event(task.id, "TASK_CANCELLED", {})
     return {"task_id": task.id, "status": task.status.value, "cancellation_requested": task.cancellation_requested}
 
@@ -166,13 +205,17 @@ async def answer_task(task_id: str, question_id: str, answer: str) -> dict[str, 
     if not task.waiting_question or task.waiting_question.get("id") != question_id: raise ValueError("unknown question_id")
     question = _question_spec(task.waiting_question)
     normalized_answer = validate_question_answer(question, answer)
-    task.input_history.append(TaskInputAnswer(
+    task_answer = TaskInputAnswer(
         question_id=question.id,
         prompt_key=question.prompt_key,
         answer=normalized_answer,
         effect=question.answer_effect,
         answered_at=datetime.now(UTC).isoformat(),
-    ))
+    )
+    task.input_history.append(task_answer)
+    active_subtask = next((item for item in task.subtasks if item.id == task.active_subtask_id), None)
+    if active_subtask:
+        active_subtask.input_history.append(task_answer)
     task.agent_context.setdefault("answers", []).append({
         "question_id": question_id,
         "prompt_key": question.prompt_key,
@@ -207,23 +250,41 @@ async def answer_task(task_id: str, question_id: str, answer: str) -> dict[str, 
                 else "SENSITIVE_INFORMATION_DENIED"
             )
             task.finished_at = datetime.now(UTC)
+            if active_subtask:
+                active_subtask.status = SubtaskStatus.FAILED
+                active_subtask.failure_reason = task.failure_reason
+                active_subtask.finished_at = task.finished_at
     elif question.answer_effect.kind == AnswerEffectKind.SELECT_SEMANTIC_OPTION:
         task.agent_context.setdefault("semantic_selections", {})[question.answer_effect.parameter] = normalized_answer
     else:
-        task.task_spec = apply_answer_effect(task.task_spec, question, normalized_answer)
-        task.contract_status = contract_status_for(task.task_spec)
-        task.contract_errors = []
+        if active_subtask and active_subtask.task_spec:
+            active_subtask.task_spec = apply_answer_effect(active_subtask.task_spec, question, normalized_answer)
+            active_subtask.contract_status = contract_status_for(active_subtask.task_spec)
+            active_subtask.contract_errors = []
+        else:
+            task.task_spec = apply_answer_effect(task.task_spec, question, normalized_answer)
+            task.contract_status = contract_status_for(task.task_spec)
+            task.contract_errors = []
     if task.status != TaskStatus.FAILED:
         task.status = TaskStatus.QUEUED
+        if active_subtask:
+            active_subtask.status = SubtaskStatus.RUNNING
         task.agent_context["resume_requires_fresh_observation"] = question.id
     task.waiting_reason, task.waiting_question = None, None
     _task_store.save(task)
+    if active_subtask and active_subtask.status == SubtaskStatus.FAILED:
+        _task_store.event(task.id, "SUBTASK_FAILED", {
+            "subtask_id": active_subtask.id,
+            "position": active_subtask.position,
+            "reason": active_subtask.failure_reason,
+        })
     _task_store.event(task.id, "USER_ANSWER_RECEIVED", {
         "question_id": question_id,
         "prompt_key": question.prompt_key,
         "answer_kind": question.type.value,
         "selected_option": normalized_answer if question.type != QuestionType.TEXT else None,
         "effect": question.answer_effect.kind.value,
+        "subtask_id": active_subtask.id if active_subtask else None,
     })
     return {"task_id": task.id, "status": task.status.value}
 
@@ -300,6 +361,8 @@ def _public_result(task) -> dict[str, object] | None:
                 }
             return {"status": "failed", "failure": {"category": "AGENT", "message": task.failure_reason or "Task failed", "recoverable": False}}
         return None
+    if task.subtasks:
+        return _public_subtask_result(task)
     requirements = task.result.get("requirements", [])
     safe_requirements = []
     if isinstance(requirements, list):
@@ -370,6 +433,64 @@ def _public_result(task) -> dict[str, object] | None:
     }
 
 
+def _public_subtask_result(task) -> dict[str, object]:
+    """Return bounded verified outcomes, never per-step Android state."""
+    items: list[dict[str, object]] = []
+    for subtask in task.subtasks:
+        result = subtask.result or {}
+        spec = subtask.task_spec
+        required_keys = {
+            requirement.key for requirement in generate_requirements(spec) if requirement.required
+        } if spec else set()
+        requirements_verified = bool(required_keys) and all(
+            subtask.requirements.get(key) is not None
+            and subtask.requirements[key].value == "satisfied"
+            and isinstance(subtask.requirement_evidence.get(key), dict)
+            for key in required_keys
+        )
+        raw_observations = result.get("observations", {})
+        observations: dict[str, object] = {}
+        if spec and isinstance(raw_observations, dict):
+            for output in spec.requested_outputs:
+                value = raw_observations.get(output.key)
+                if isinstance(value, dict):
+                    observations[output.key] = {
+                        "status": value.get("status") if value.get("status") in {
+                            "observed", "unknown", "unavailable",
+                        } else "unknown",
+                        "value": _safe_observed_value(value.get("value")),
+                    }
+        outputs_verified = bool(spec) and all(
+            not output.required
+            or isinstance(observations.get(output.key), dict)
+            and observations[output.key].get("status") == "observed"
+            for output in spec.requested_outputs
+        )
+        verified = (
+            subtask.status == SubtaskStatus.SUCCEEDED
+            and bool(result.get("verified"))
+            and requirements_verified
+            and outputs_verified
+        )
+        items.append({
+            "id": subtask.id,
+            "position": subtask.position,
+            "status": subtask.status.value,
+            "summary": result.get("summary"),
+            "verified": verified,
+            "observations": observations,
+            "steps": subtask.step_number,
+            "failure_reason": subtask.failure_reason,
+        })
+    return {
+        "status": task.status.value,
+        "summary": task.result.get("summary"),
+        "verified": bool(items) and all(bool(item["verified"]) for item in items),
+        "subtasks": items,
+        "steps": task.step_number,
+    }
+
+
 def _public_contract(task) -> dict[str, object]:
     spec = task.task_spec
     return {
@@ -429,7 +550,35 @@ def _safe_observed_value(value: object) -> object:
 def _public_event(event: dict[str, object]) -> dict[str, object]:
     # Accessibility snapshots and executable refs deliberately remain internal.
     event_type = str(event["event_type"]).lower()
-    return {"seq": event["seq"], "timestamp": event["timestamp"], "type": event_type, "worker_id": event["worker_id"], "payload": event["payload"]}
+    payload = event.get("payload")
+    return {
+        "seq": event["seq"],
+        "timestamp": event["timestamp"],
+        "type": event_type,
+        "worker_id": event["worker_id"],
+        "payload": _safe_public_event_value(payload),
+    }
+
+
+def _safe_public_event_value(value: object) -> object:
+    """Keep semantic progress while stripping snapshot-local execution data."""
+    if isinstance(value, dict):
+        blocked = {
+            "snapshot", "snapshot_id", "target", "target_ref", "raw_accessibility_tree",
+            "before", "after", "intermediate",
+        }
+        return {
+            str(key): _safe_public_event_value(item)
+            for key, item in value.items()
+            if str(key) not in blocked and not str(key).startswith("raw_")
+        }
+    if isinstance(value, list):
+        return [_safe_public_event_value(item) for item in value[:100]]
+    if isinstance(value, str):
+        return re.sub(r"\bs\d+:e\d+\b", "[ui-ref]", value, flags=re.I)[:4000]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return str(value)[:4000]
 
 
 @server.tool(name="get_device_status", description="Read the selected Android runtime status without performing a mutation.")

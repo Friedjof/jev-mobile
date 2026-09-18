@@ -11,7 +11,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field, model_validator
 
-from .tasks import RequirementStatus, TaskContractStatus, TaskInputAnswer, TaskSpec, contract_status_for
+from .tasks import OrderedSubtask, RequirementStatus, TaskContractStatus, TaskInputAnswer, TaskSpec, contract_status_for
 
 
 class TaskStatus(StrEnum):
@@ -29,6 +29,8 @@ class MobileTask(BaseModel):
     id: str
     instruction: str
     task_spec: TaskSpec
+    subtasks: list[OrderedSubtask] = Field(default_factory=list)
+    active_subtask_id: str | None = None
     contract_status: TaskContractStatus | None = None
     contract_errors: list[str] = Field(default_factory=list)
     status: TaskStatus = TaskStatus.QUEUED
@@ -87,14 +89,18 @@ class TaskStore:
             try: self._connection.execute(f"ALTER TABLE task_events ADD COLUMN {column} {definition}")
             except sqlite3.OperationalError: pass
 
-    def create(self, instruction: str, task_spec: TaskSpec) -> MobileTask:
+    def create(
+        self, instruction: str, task_spec: TaskSpec, subtasks: list[OrderedSubtask] | None = None,
+    ) -> MobileTask:
         task = MobileTask(id=f"task_{uuid4().hex}", instruction=instruction, task_spec=task_spec,
-                          contract_status=contract_status_for(task_spec), created_at=datetime.now(UTC))
+                          subtasks=subtasks or [], contract_status=contract_status_for(task_spec),
+                          created_at=datetime.now(UTC))
         self.save(task)
         self.event(task.id, "TASK_QUEUED", {
             "instruction": instruction,
             "contract_status": task.contract_status.value,
             "contract_version": task.task_spec.contract_version,
+            "subtask_count": len(task.subtasks),
         })
         return task
 

@@ -27,6 +27,8 @@ from ..tasks import (
     QuestionSpec,
     QuestionType,
     RequirementStatus,
+    OrderedSubtask,
+    SubtaskStatus,
     TaskContractStatus,
     TaskPolicyMode,
     TaskSpec,
@@ -58,18 +60,26 @@ class MobileAgent:
     async def run(self, task_id: str) -> None:
         task = self.store.get(task_id)
         if not task or task.status in {TaskStatus.CANCELLED, TaskStatus.SUCCEEDED, TaskStatus.FAILED}: return
-        task.status, task.started_at = TaskStatus.RUNNING, task.started_at or datetime.now(UTC); self.store.save(task)
-        task = await self._resolve_task_contract(task)
+        task.status, task.started_at = TaskStatus.RUNNING, task.started_at or datetime.now(UTC); self._save(task)
+        subtask = self._activate_subtask(task)
+        instruction = subtask.instruction if subtask else task.instruction
+        task_spec = subtask.task_spec if subtask and subtask.task_spec else (
+            task_spec_from_goal(instruction) if subtask else task.task_spec
+        )
+        if subtask and subtask.task_spec is None:
+            subtask.task_spec = task_spec
+            subtask.contract_status = TaskContractStatus.PENDING
+            self._save(task)
+        task = await self._resolve_task_contract(task, instruction, task_spec, subtask)
         if task is None:
             return
-        declared_requirements = [item for item in generate_requirements(task.task_spec) if item.required]
+        task_spec = subtask.task_spec if subtask and subtask.task_spec else task.task_spec
+        declared_requirements = [item for item in generate_requirements(task_spec) if item.required]
         if not declared_requirements:
-            task.status = TaskStatus.FAILED
-            task.failure_reason = "NO_VERIFIABLE_COMPLETION_CRITERIA"
-            task.finished_at = datetime.now(UTC)
-            self.store.save(task)
+            self._fail_execution(task, subtask, "NO_VERIFIABLE_COMPLETION_CRITERIA")
             self.store.event(task.id, "NO_VERIFIABLE_COMPLETION_CRITERIA", {
-                "intent": task.task_spec.intent,
+                "intent": task_spec.intent,
+                "subtask_id": subtask.id if subtask else None,
                 "reason": "The task contract contains no required observable completion criteria.",
             }, task.worker_id)
             return
@@ -77,6 +87,8 @@ class MobileAgent:
         persisted_history = task.agent_context.get("action_history")
         history = list(persisted_history) if isinstance(persisted_history, list) else []
         persistence_list_seen = False
+        base_step = task.step_number
+        base_subtask_step = subtask.step_number if subtask else 0
         trace = TraceWriter(self.settings.trace_dir)
         try:
             async with self.device_factory() as device:
@@ -86,7 +98,7 @@ class MobileAgent:
                     before = normalize(await device.observe())
                     resumed_question = task.agent_context.pop("resume_requires_fresh_observation", None)
                     if resumed_question:
-                        self.store.save(task)
+                        self._save(task)
                         self.store.event(task.id, "INPUT_RESUME_OBSERVATION", {
                             "question_id": resumed_question,
                             "snapshot": before.fingerprint,
@@ -110,23 +122,23 @@ class MobileAgent:
                             # make another create action eligible.
                             ownership = EntityOwnership.CURRENT_TASK
                         self.store.event(task.id, "PENDING_MUTATION_RECONCILED", {"outcome": outcome}, task.worker_id)
-                        task.pending_mutation = None; self.store.save(task)
+                        task.pending_mutation = None; self._save(task)
                     # A root entry that returns to the same foreign editor is
                     # a lifecycle boundary, not an invitation to keep pressing
                     # Back. Resetting that task may lose user state, so ask.
-                    create_oriented = task.task_spec.intent.startswith("create")
+                    create_oriented = task_spec.intent.startswith("create")
                     if (create_oriented and task.agent_context.get("root_attempted")
                             and interaction_context == InteractionContext.EDITOR
-                            and ownership == EntityOwnership.FOREIGN and task.task_spec.app_package):
+                            and ownership == EntityOwnership.FOREIGN and task_spec.app_package):
                         authorization = task.agent_context.get("lifecycle_authorization")
                         if isinstance(authorization, dict) and authorization.get("operation") == "restart_app_process" and not authorization.get("consumed"):
                             entry = journal.begin_action(action="restart_app_process", snapshot_id=before.raw_snapshot_id or "recovery",
                                                          intended_effect="Restart target app process", family=MutationFamily.NAVIGATION)
                             task.pending_mutation = {"id": entry.id, "action": "restart_app_process", "family": "navigation", "intended_effect": entry.intended_effect}
                             authorization["consumed"] = True
-                            self.store.save(task)
-                            self.store.event(task.id, "PROCESS_RESTART_EXECUTION_STARTED", {"mutation_id": entry.id, "package": task.task_spec.app_package})
-                            await device.restart_app_process(task.task_spec.app_package)
+                            self._save(task)
+                            self.store.event(task.id, "PROCESS_RESTART_EXECUTION_STARTED", {"mutation_id": entry.id, "package": task_spec.app_package})
+                            await device.restart_app_process(task_spec.app_package)
                             await asyncio.sleep(0.8)
                             intermediate = normalize(await device.observe())
                             await asyncio.sleep(0.5)
@@ -134,35 +146,37 @@ class MobileAgent:
                             result = "stable_progress" if intermediate.fingerprint == settled.fingerprint and context_type(settled) != InteractionContext.EDITOR else ("transient_progress" if intermediate.fingerprint != settled.fingerprint else "no_progress")
                             task.pending_mutation = None
                             task.agent_context.setdefault("recovery_history", []).append({"operation": "restart_app_process", "result": result, "before": before.fingerprint, "after": settled.fingerprint})
-                            self.store.save(task)
+                            self._save(task)
                             self.store.event(task.id, "PROCESS_RESTART_RESULT", {"result": result, "before": before.fingerprint, "intermediate": intermediate.fingerprint, "after": settled.fingerprint})
                             if result != "stable_progress":
-                                task.status = TaskStatus.FAILED
-                                task.failure_reason = "ORIENTATION_BLOCKED_BY_PERSISTED_APP_STATE"
-                                self.store.save(task)
+                                self._fail_execution(task, subtask, "ORIENTATION_BLOCKED_BY_PERSISTED_APP_STATE")
                                 return
                             task.agent_context["root_attempted"] = False
                             continue
                         reset_was_ineffective = isinstance(authorization, dict) and authorization.get("operation") == "reset_app_task" and authorization.get("consumed")
                         if reset_was_ineffective:
                             task.agent_context.setdefault("recovery_history", []).append({"operation": "reset_app_task", "result": "no_progress", "state": before.fingerprint})
-                            question = reset_question(task.task_spec.app_package, "restart_app_process")
+                            question = reset_question(task_spec.app_package, "restart_app_process")
                             task.status, task.waiting_question, task.waiting_reason = TaskStatus.WAITING_FOR_USER, question, str(question["text"])
-                            self.store.save(task)
+                            if subtask:
+                                subtask.status = SubtaskStatus.WAITING_FOR_USER
+                            self._save(task)
                             self.store.event(task.id, "APP_INTERNAL_ROOT_RECOVERY_FAILED", {"result": "no_progress"})
-                            self.store.event(task.id, "PROCESS_RESTART_REQUIRES_APPROVAL", {"package": task.task_spec.app_package})
+                            self.store.event(task.id, "PROCESS_RESTART_REQUIRES_APPROVAL", {"package": task_spec.app_package})
                             self.store.event(task.id, "TASK_WAITING_FOR_USER", {"question": question})
                             return
-                        decision = evaluate_reset_safety(task_id=task.id, package=task.task_spec.app_package,
+                        decision = evaluate_reset_safety(task_id=task.id, package=task_spec.app_package,
                                                          ownership=ownership, context=interaction_context,
                                                          authorization=authorization)
                         if decision == LifecycleResetDecision.REQUIRE_APPROVAL:
-                            question = reset_question(task.task_spec.app_package)
+                            question = reset_question(task_spec.app_package)
                             task.status = TaskStatus.WAITING_FOR_USER
+                            if subtask:
+                                subtask.status = SubtaskStatus.WAITING_FOR_USER
                             task.waiting_question = question
                             task.waiting_reason = str(question["text"])
-                            self.store.save(task)
-                            self.store.event(task.id, "LIFECYCLE_RESET_REQUIRES_APPROVAL", {"package": task.task_spec.app_package})
+                            self._save(task)
+                            self.store.event(task.id, "LIFECYCLE_RESET_REQUIRES_APPROVAL", {"package": task_spec.app_package})
                             self.store.event(task.id, "TASK_WAITING_FOR_USER", {"question": question})
                             return
                         if decision == LifecycleResetDecision.ALLOW:
@@ -171,13 +185,13 @@ class MobileAgent:
                             task.pending_mutation = {"id": entry.id, "action": "reset_app_task", "family": "navigation", "intended_effect": entry.intended_effect}
                             authorization = task.agent_context.get("lifecycle_authorization")
                             if isinstance(authorization, dict): authorization["consumed"] = True
-                            self.store.save(task)
-                            self.store.event(task.id, "LIFECYCLE_RESET_EXECUTED", {"mutation_id": entry.id, "package": task.task_spec.app_package})
-                            await device.reset_app_task(task.task_spec.app_package)
+                            self._save(task)
+                            self.store.event(task.id, "LIFECYCLE_RESET_EXECUTED", {"mutation_id": entry.id, "package": task_spec.app_package})
+                            await device.reset_app_task(task_spec.app_package)
                             await asyncio.sleep(0.8)
                             task.pending_mutation = None
                             task.agent_context["root_attempted"] = False
-                            self.store.save(task)
+                            self._save(task)
                             self.store.event(task.id, "LIFECYCLE_RESET_RESULT", {"result": "pending_fresh_observation"})
                             continue
                     if cancellation_requested:
@@ -186,13 +200,20 @@ class MobileAgent:
                         # and no new device mutation is selected below.
                         task.cancellation_requested = True
                         task.status = TaskStatus.CANCELLED
+                        cancelled_subtasks = self._cancel_subtasks(task)
+                        self._save(task)
+                        for cancelled_subtask in cancelled_subtasks:
+                            self.store.event(task.id, "SUBTASK_CANCELLED", {
+                                "subtask_id": cancelled_subtask.id,
+                                "position": cancelled_subtask.position,
+                            }, task.worker_id)
                         self.store.event(task.id, "TASK_CANCELLED", {}, task.worker_id)
                         break
                     catalog = ActionCatalog.build(before, refs)
-                    safe_creation = evaluate_safe_creation_context(before, target_package=task.task_spec.app_package, ownership=ownership, actions=catalog.actions)
+                    safe_creation = evaluate_safe_creation_context(before, target_package=task_spec.app_package, ownership=ownership, actions=catalog.actions)
                     selections = task.agent_context.get("semantic_selections")
                     requirements = evaluator.evaluate(
-                        task.task_spec,
+                        task_spec,
                         before,
                         selections if isinstance(selections, dict) else None,
                     )
@@ -212,14 +233,14 @@ class MobileAgent:
                         if not persistence_list_seen and persisted.status == RequirementStatus.SATISFIED and not editor_open:
                             persistence_list_seen = True; persisted.status = RequirementStatus.NEEDS_VERIFICATION
                             persisted.reason = "entity found outside editor; reopening required"
-                        elif persistence_list_seen and editor_open and any(e.editable and (e.value or "") == (task.task_spec.title or "") for e in before.elements):
+                        elif persistence_list_seen and editor_open and any(e.editable and (e.value or "") == (task_spec.title or "") for e in before.elements):
                             persisted.status = RequirementStatus.SATISFIED; persisted.reason = "content independently re-observed after reopening"
                             persisted.evidence = {
                                 "snapshot_id": before.raw_snapshot_id,
                                 "package": before.app,
                                 "semantic_role": "entity_editor",
                                 "label": "reopened entity",
-                                "observed_value": task.task_spec.title,
+                                "observed_value": task_spec.title,
                                 "confidence": 1.0,
                                 "verification": "independently_reopened",
                             }
@@ -237,9 +258,11 @@ class MobileAgent:
                         orientation = "ESCAPING_FOREIGN_CONTEXT"
                     elif orientation == "READY" and any(r.kind == "note_created" and r.status != RequirementStatus.SATISFIED for r in requirements):
                         task.current_subgoal = "Create the required new entity"
-                    task.step_number = step
+                    task.step_number = base_step + step
+                    if subtask:
+                        subtask.step_number = base_subtask_step + step
                     task.agent_context = {**task.agent_context, "snapshot": catalog.snapshot_id, "subgoal": task.current_subgoal, "interaction_context": interaction_context.value, "entity_ownership": ownership.value, "orientation": orientation, "orientation_evidence": safe_creation}
-                    self.store.save(task); self.store.event(task.id, "SNAPSHOT_OBSERVED", {"step": step, "snapshot": catalog.snapshot_id})
+                    self._save(task); self.store.event(task.id, "SNAPSHOT_OBSERVED", {"step": task.step_number, "snapshot": catalog.snapshot_id, "subtask_id": subtask.id if subtask else None})
                     required_requirements = [r for r in requirements if r.required]
                     if required_requirements and all(r.status == RequirementStatus.SATISFIED for r in required_requirements):
                         missing_evidence = [r.key for r in required_requirements if not task.requirement_evidence.get(r.key)]
@@ -248,35 +271,41 @@ class MobileAgent:
                             self.store.event(task.id, "VERIFICATION_EVIDENCE_INCOMPLETE", {
                                 "missing_requirements": missing_evidence,
                             }, task.worker_id)
-                            self.store.save(task)
+                            self._save(task)
                             continue
-                        task.status = TaskStatus.SUCCEEDED
-                        task.result = self._verified_result(task, requirements, step, trace)
+                        result = self._verified_result(task, task_spec, requirements, task.step_number, trace)
+                        self._complete_execution(task, subtask, result)
                         break
                     context = before.model_copy(update={
                         "recent_context": history[-10:],
                         "agent_context": {
-                            "task_spec": task.task_spec.model_dump(mode="json"),
+                            "task_spec": task_spec.model_dump(mode="json"),
                             "current_subgoal": task.current_subgoal,
                             "requirements": {r.key: r.status.value for r in requirements},
                             "loop_status": self._loop_status(history, before.fingerprint),
+                            "subtask": {
+                                "id": subtask.id,
+                                "position": subtask.position,
+                                "total": len(task.subtasks),
+                            } if subtask else None,
+                            "completed_subtasks": task.agent_context.get("completed_subtasks", []),
                         },
                     })
-                    input_question = self._ambiguity_question(task, requirements)
+                    input_question = self._ambiguity_question(task, requirements, subtask)
                     candidates, mapping = self._candidates(
-                        catalog, refs, requirements, task.task_spec, before.app, history,
+                        catalog, refs, requirements, task_spec, before.app, history,
                         before.fingerprint, interaction_context, ownership, orientation,
                         input_question=input_question,
                     )
                     started = time.monotonic()
-                    try: decision = await self.provider.decide(task.instruction, context, candidates)
+                    try: decision = await self.provider.decide(instruction, context, candidates)
                     except ProviderUnavailable as error:
                         # Jev/network availability is not evidence that the
                         # Android task failed. Keep the task resumable and let
                         # the durable worker re-claim after a short lease.
                         task.status = TaskStatus.RECOVERING; task.failure_reason = str(error)
                         task.lease_expires_at = datetime.fromtimestamp(time.time() + 20, UTC)
-                        self.store.save(task); self.store.event(task.id, "RECOVERY_STARTED", {"category": "JEV_DECISION", "reason": str(error)})
+                        self._save(task); self.store.event(task.id, "RECOVERY_STARTED", {"category": "JEV_DECISION", "reason": str(error), "subtask_id": subtask.id if subtask else None})
                         return
                     selected = next((a for a in candidates if a.id == decision.action_id), None)
                     if selected is None: raise RuntimeError("Jev selected an invalid action")
@@ -290,16 +319,16 @@ class MobileAgent:
                     if selected.kind == ActionKind.REQUEST_INPUT:
                         if not selected.question:
                             raise RuntimeError("REQUEST_INPUT action has no QuestionSpec")
-                        self._pause_for_input(task, QuestionSpec.model_validate(selected.question))
+                        self._pause_for_input(task, QuestionSpec.model_validate(selected.question), subtask)
                         return
                     action, ref, catalog_target = mapping[selected.id]
                     family = action.mutation_family
                     if action.kind == ActionKind.OPEN_APP_ROOT:
                         task.agent_context["root_attempted"] = True
-                        self.store.save(task); self.store.event(task.id, "APP_ROOT_ENTRY_ATTEMPTED", {"package": action.package})
+                        self._save(task); self.store.event(task.id, "APP_ROOT_ENTRY_ATTEMPTED", {"package": action.package})
                     engine = MutationEngine(refs, journal, lambda: self._observe(device))
                     task.pending_mutation = {"action": action.kind.value, "family": family.value, "target_ref": ref, "text": action.text, "intended_effect": action.label}
-                    self.store.save(task); self.store.event(task.id, "MUTATION_STARTED", task.pending_mutation)
+                    self._save(task); self.store.event(task.id, "MUTATION_STARTED", task.pending_mutation)
                     if os.getenv("JEV_MOBILE_FAULT_AFTER_MUTATION_BEGIN") == "1":
                         # Development-only crash-window probe. The pending intent
                         # is already durable; a replacement worker must observe
@@ -308,14 +337,14 @@ class MobileAgent:
                     entry = await engine.execute(action.kind.value, ref, action.label, self._operation(device, action), lambda after: after.fingerprint != before.fingerprint or self._text_effect(after, action), family, lambda point, entry: self._record_fault(task, point, entry))
                     if family == MutationFamily.CREATE_ENTITY and entry.outcome == MutationOutcome.EXECUTED_CONFIRMED:
                         task.agent_context["entity_ownership"] = EntityOwnership.CURRENT_TASK.value
-                    task.pending_mutation = None; self.store.save(task); self.store.event(task.id, "MUTATION_RESOLVED", {"id": entry.id, "outcome": entry.outcome.value})
+                    task.pending_mutation = None; self._save(task); self.store.event(task.id, "MUTATION_RESOLVED", {"id": entry.id, "outcome": entry.outcome.value})
                     signature = self._attempt_signature(action, catalog_target)
                     after = engine.last_observation
                     requirement_before = {r.key: r.status.value for r in requirements}
                     requirement_after = requirement_before
                     if after is not None:
                         post_requirements = evaluator.evaluate(
-                            task.task_spec,
+                            task_spec,
                             after,
                             selections if isinstance(selections, dict) else None,
                         )
@@ -361,7 +390,7 @@ class MobileAgent:
                             "suppressed_edge": signature,
                         }, task.worker_id)
                     task.agent_context["action_history"] = history[-24:]
-                    self.store.save(task)
+                    self._save(task)
                     repeated = [item for item in history[-3:] if item.get("signature") == signature and item.get("state") == before.fingerprint and item["mutation"] == MutationOutcome.EXECUTED_NO_EFFECT.value]
                     if len(repeated) >= 3:
                         self.store.event(task.id, "RECOVERY_STARTED", {"category": "LOOP_DETECTION", "action": action.label})
@@ -370,30 +399,188 @@ class MobileAgent:
                     if entry.outcome in {MutationOutcome.TARGET_STALE, MutationOutcome.EXECUTED_AMBIGUOUS}: continue
                 else: raise RuntimeError("agent step limit reached")
         except asyncio.CancelledError:
-            task.status = TaskStatus.CANCELLED; raise
+            task.status = TaskStatus.CANCELLED
+            self._cancel_subtasks(task)
+            raise
         except Exception as error:
-            task.status, task.failure_reason = TaskStatus.FAILED, str(error)
+            self._fail_execution(task, subtask, str(error))
         finally:
             if task.status in {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELLED}:
                 task.finished_at = datetime.now(UTC)
-            self.store.save(task)
+            self._save(task)
 
     @staticmethod
     async def _observe(device: DeviceAdapter): return normalize(await device.observe())
 
-    async def _resolve_task_contract(self, task: MobileTask) -> MobileTask | None:
-        validation = validate_task_contract(task.task_spec)
+    def _save(self, task: MobileTask) -> None:
+        """Checkpoint parent state and the active durable subtask together."""
+        active = next((item for item in task.subtasks if item.id == task.active_subtask_id), None)
+        if active and active.status in {SubtaskStatus.RUNNING, SubtaskStatus.WAITING_FOR_USER}:
+            active.requirements = dict(task.requirements)
+            active.requirement_evidence = dict(task.requirement_evidence)
+        self.store.save(task)
+
+    def _activate_subtask(self, task: MobileTask) -> OrderedSubtask | None:
+        if not task.subtasks:
+            return None
+        active = next((item for item in task.subtasks if item.id == task.active_subtask_id), None)
+        if active and active.status in {SubtaskStatus.RUNNING, SubtaskStatus.WAITING_FOR_USER}:
+            return active
+        active = next((item for item in task.subtasks if item.status == SubtaskStatus.QUEUED), None)
+        if active is None:
+            return None
+        active.status = SubtaskStatus.RUNNING
+        active.started_at = active.started_at or datetime.now(UTC)
+        task.active_subtask_id = active.id
+        task.requirements = dict(active.requirements)
+        task.requirement_evidence = dict(active.requirement_evidence)
+        task.current_subgoal = active.instruction
+        task.pending_mutation = None
+        task.failure_reason = None
+        task.agent_context = {"completed_subtasks": self._completed_subtask_context(task)}
+        self._save(task)
+        self.store.event(task.id, "SUBTASK_STARTED", {
+            "subtask_id": active.id,
+            "position": active.position,
+            "total": len(task.subtasks),
+            "instruction": active.instruction,
+        }, task.worker_id)
+        return active
+
+    @staticmethod
+    def _completed_subtask_context(task: MobileTask) -> list[dict[str, object]]:
+        return [
+            {
+                "id": item.id,
+                "instruction": item.instruction,
+                "summary": item.result.get("summary") if item.result else None,
+                "observations": item.result.get("observations", {}) if item.result else {},
+            }
+            for item in task.subtasks
+            if item.status == SubtaskStatus.SUCCEEDED
+        ]
+
+    def _complete_execution(
+        self, task: MobileTask, subtask: OrderedSubtask | None, result: dict[str, object],
+    ) -> None:
+        if subtask is None:
+            task.status = TaskStatus.SUCCEEDED
+            task.result = result
+            return
+        subtask.requirements = dict(task.requirements)
+        subtask.requirement_evidence = dict(task.requirement_evidence)
+        subtask.result = result
+        subtask.status = SubtaskStatus.SUCCEEDED
+        subtask.finished_at = datetime.now(UTC)
+        worker_id = task.worker_id
+        remaining = [item for item in task.subtasks if item.status == SubtaskStatus.QUEUED]
+        task.active_subtask_id = None
+        task.current_subgoal = None
+        task.requirements = {}
+        task.requirement_evidence = {}
+        task.pending_mutation = None
+        task.agent_context = {"completed_subtasks": self._completed_subtask_context(task)}
+        if remaining:
+            task.status = TaskStatus.QUEUED
+            task.worker_id = None
+            task.claimed_at = None
+            task.heartbeat_at = None
+            task.lease_expires_at = None
+            self._save(task)
+            self.store.event(task.id, "SUBTASK_SUCCEEDED", {
+                "subtask_id": subtask.id,
+                "position": subtask.position,
+                "steps": subtask.step_number,
+                "verified": bool(result.get("verified")),
+            }, worker_id)
+            self.store.event(task.id, "SUBTASK_ADVANCED", {
+                "completed_subtask_id": subtask.id,
+                "next_subtask_id": remaining[0].id,
+            }, worker_id)
+            return
+        task.status = TaskStatus.SUCCEEDED
+        task.result = {
+            "summary": f"Completed and verified {len(task.subtasks)} ordered subtasks.",
+            "verified": True,
+            "steps": task.step_number,
+            "subtasks": [
+                {
+                    "id": item.id,
+                    "instruction": item.instruction,
+                    "status": item.status.value,
+                    "summary": item.result.get("summary") if item.result else None,
+                }
+                for item in task.subtasks
+            ],
+        }
+        self._save(task)
+        self.store.event(task.id, "SUBTASK_SUCCEEDED", {
+            "subtask_id": subtask.id,
+            "position": subtask.position,
+            "steps": subtask.step_number,
+            "verified": bool(result.get("verified")),
+        }, worker_id)
+
+    def _fail_execution(self, task: MobileTask, subtask: OrderedSubtask | None, reason: str) -> None:
+        task.status = TaskStatus.FAILED
+        task.failure_reason = reason
+        task.finished_at = datetime.now(UTC)
+        if subtask:
+            subtask.status = SubtaskStatus.FAILED
+            subtask.failure_reason = reason
+            subtask.finished_at = datetime.now(UTC)
+        self._save(task)
+        if subtask:
+            self.store.event(task.id, "SUBTASK_FAILED", {
+                "subtask_id": subtask.id,
+                "position": subtask.position,
+                "reason": reason,
+            }, task.worker_id)
+
+    @staticmethod
+    def _cancel_subtasks(task: MobileTask) -> list[OrderedSubtask]:
+        now = datetime.now(UTC)
+        cancelled: list[OrderedSubtask] = []
+        for subtask in task.subtasks:
+            if subtask.status in {SubtaskStatus.QUEUED, SubtaskStatus.RUNNING, SubtaskStatus.WAITING_FOR_USER}:
+                subtask.status = SubtaskStatus.CANCELLED
+                subtask.finished_at = now
+                cancelled.append(subtask)
+        return cancelled
+
+    @staticmethod
+    def _set_execution_contract(
+        task: MobileTask, subtask: OrderedSubtask | None, spec: TaskSpec,
+        status: TaskContractStatus, errors: list[str],
+    ) -> None:
+        if subtask:
+            subtask.task_spec = spec
+            subtask.contract_status = status
+            subtask.contract_errors = list(errors)
+        else:
+            task.task_spec = spec
+            task.contract_status = status
+            task.contract_errors = list(errors)
+
+    async def _resolve_task_contract(
+        self, task: MobileTask, instruction: str | None = None,
+        task_spec: TaskSpec | None = None, subtask: OrderedSubtask | None = None,
+    ) -> MobileTask | None:
+        instruction = instruction or task.instruction
+        task_spec = task_spec or task.task_spec
+        validation = validate_task_contract(task_spec)
         if validation.valid:
             authorizations = task.agent_context.get("information_authorizations")
             authorized_keys = set(authorizations) if isinstance(authorizations, dict) else set()
-            authorization_question = information_authorization_question(task.task_spec, authorized_keys)
+            authorization_question = information_authorization_question(task_spec, authorized_keys)
             if authorization_question:
-                self._pause_for_input(task, authorization_question)
+                self._pause_for_input(task, authorization_question, subtask)
                 return None
-            if task.contract_status != TaskContractStatus.READY or task.contract_errors:
-                task.contract_status = TaskContractStatus.READY
-                task.contract_errors = []
-                self.store.save(task)
+            status = subtask.contract_status if subtask else task.contract_status
+            errors = subtask.contract_errors if subtask else task.contract_errors
+            if status != TaskContractStatus.READY or errors:
+                self._set_execution_contract(task, subtask, task_spec, TaskContractStatus.READY, [])
+                self._save(task)
             return task
 
         interpretation = None
@@ -401,59 +588,65 @@ class MobileAgent:
         if callable(interpret):
             try:
                 interpretation = await interpret(
-                    task.instruction,
+                    instruction,
                     SemanticState(app=None, elements=[], fingerprint="task-contract"),
                 )
             except ProviderUnavailable as error:
                 task.status = TaskStatus.RECOVERING
                 task.failure_reason = str(error)
-                task.contract_errors = validation.errors
+                self._set_execution_contract(
+                    task, subtask, task_spec, TaskContractStatus.PENDING, validation.errors,
+                )
                 task.lease_expires_at = datetime.fromtimestamp(time.time() + 20, UTC)
-                self.store.save(task)
+                self._save(task)
                 self.store.event(task.id, "TASK_CONTRACT_INTERPRETATION_DEFERRED", {
                     "reason": str(error),
+                    "subtask_id": subtask.id if subtask else None,
                 }, task.worker_id)
                 return None
         if interpretation is not None:
             proposed = interpretation.to_task_spec()
             proposed_validation = validate_task_contract(proposed)
             if proposed_validation.valid:
-                task.task_spec = proposed
-                task.contract_status = TaskContractStatus.READY
-                task.contract_errors = []
+                self._set_execution_contract(task, subtask, proposed, TaskContractStatus.READY, [])
                 task.failure_reason = None
-                self.store.save(task)
+                self._save(task)
                 self.store.event(task.id, "TASK_CONTRACT_RESOLVED", {
                     "contract_version": proposed.contract_version,
                     "intent": proposed.intent,
                     "target_app": proposed.app,
                     "policy": proposed.policy.mode.value if proposed.policy else None,
                     "requirements": len(proposed.completion),
+                    "subtask_id": subtask.id if subtask else None,
                 }, task.worker_id)
                 return task
-            task.task_spec = proposed
+            task_spec = proposed
+            self._set_execution_contract(
+                task, subtask, proposed, TaskContractStatus.PENDING, proposed_validation.errors,
+            )
             validation = proposed_validation
 
-        answered_prompt_keys = {answer.prompt_key for answer in task.input_history}
-        question = contract_question(task.task_spec, validation.errors, answered_prompt_keys)
+        input_history = subtask.input_history if subtask else task.input_history
+        answered_prompt_keys = {answer.prompt_key for answer in input_history}
+        question = contract_question(task_spec, validation.errors, answered_prompt_keys)
         if question:
-            task.contract_status = TaskContractStatus.PENDING
-            task.contract_errors = validation.errors
-            self._pause_for_input(task, question)
+            self._set_execution_contract(
+                task, subtask, task_spec, TaskContractStatus.PENDING, validation.errors,
+            )
+            self._pause_for_input(task, question, subtask)
             return None
 
-        declared = [item for item in generate_requirements(task.task_spec) if item.required]
+        declared = [item for item in generate_requirements(task_spec) if item.required]
         reason = "NO_VERIFIABLE_COMPLETION_CRITERIA" if not declared else "TASK_CONTRACT_INCOMPLETE"
-        task.status = TaskStatus.FAILED
-        task.contract_status = TaskContractStatus.UNSUPPORTED
-        task.contract_errors = validation.errors
-        task.failure_reason = reason
-        task.finished_at = datetime.now(UTC)
-        self.store.save(task)
+        self._set_execution_contract(
+            task, subtask, task_spec, TaskContractStatus.UNSUPPORTED, validation.errors,
+        )
+        self._fail_execution(task, subtask, reason)
         event_type = reason if reason == "NO_VERIFIABLE_COMPLETION_CRITERIA" else "TASK_CONTRACT_UNSUPPORTED"
         self.store.event(task.id, event_type, {
             "reason": reason,
             "errors": validation.errors,
+            "subtask_id": subtask.id if subtask else None,
         }, task.worker_id)
         return None
 
@@ -467,9 +660,11 @@ class MobileAgent:
         }
 
     @staticmethod
-    def _verified_result(task: MobileTask, requirements, step: int, trace: TraceWriter) -> dict[str, object]:
+    def _verified_result(
+        task: MobileTask, task_spec: TaskSpec, requirements, step: int, trace: TraceWriter,
+    ) -> dict[str, object]:
         observations: dict[str, object] = {}
-        for output in task.task_spec.requested_outputs:
+        for output in task_spec.requested_outputs:
             matching = next(
                 (evidence for evidence in task.requirement_evidence.values() if evidence.get("output_key") == output.key),
                 None,
@@ -716,19 +911,33 @@ class MobileAgent:
         }
         return bool(set(label.replace("&", " ").split()) & (hints | navigation))
 
-    def _pause_for_input(self, task: MobileTask, question: QuestionSpec) -> None:
+    def _pause_for_input(
+        self, task: MobileTask, question: QuestionSpec, subtask: OrderedSubtask | None = None,
+    ) -> None:
         task.status = TaskStatus.WAITING_FOR_USER
+        if subtask:
+            subtask.status = SubtaskStatus.WAITING_FOR_USER
         task.waiting_question = question.model_dump(mode="json")
         task.waiting_reason = question.text
         task.lease_expires_at = None
-        self.store.save(task)
+        self._save(task)
+        if subtask:
+            self.store.event(task.id, "SUBTASK_WAITING_FOR_USER", {
+                "subtask_id": subtask.id,
+                "position": subtask.position,
+                "question_id": question.id,
+            }, task.worker_id)
         self.store.event(task.id, "TASK_WAITING_FOR_USER", {
             "question": question.model_dump(mode="json"),
+            "subtask_id": subtask.id if subtask else None,
         }, task.worker_id)
 
     @staticmethod
-    def _ambiguity_question(task: MobileTask, requirements) -> QuestionSpec | None:
-        answered = {answer.prompt_key for answer in task.input_history}
+    def _ambiguity_question(
+        task: MobileTask, requirements, subtask: OrderedSubtask | None = None,
+    ) -> QuestionSpec | None:
+        input_history = subtask.input_history if subtask else task.input_history
+        answered = {answer.prompt_key for answer in input_history}
         for requirement in requirements:
             ambiguity = requirement.evidence.get("ambiguity") if isinstance(requirement.evidence, dict) else None
             if not isinstance(ambiguity, list) or not requirement.output_key:
@@ -808,6 +1017,6 @@ class MobileAgent:
         if not task: return None
         # Cancellation is cooperative: never interrupt an in-flight mutation.
         task.cancellation_requested = True
-        self.store.save(task)
+        self._save(task)
         self.store.event(task.id, "TASK_CANCELLATION_REQUESTED", {})
         return task

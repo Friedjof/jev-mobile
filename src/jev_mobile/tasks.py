@@ -2,12 +2,96 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from enum import StrEnum
 from hashlib import sha256
 import re
+from typing import Annotated
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+MAX_ORDERED_SUBTASKS = 20
+
+
+class SubtaskStatus(StrEnum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    WAITING_FOR_USER = "waiting_for_user"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class SubtaskRequest(BaseModel):
+    """One optional, ordered outcome supplied by an MCP parent."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str | None = Field(default=None, min_length=1, max_length=80, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+    instruction: str = Field(min_length=1, max_length=2000)
+
+    @field_validator("instruction")
+    @classmethod
+    def normalize_instruction(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("subtask instruction must not be blank")
+        return normalized
+
+
+SubtaskRequestList = Annotated[
+    list[SubtaskRequest],
+    Field(min_length=1, max_length=MAX_ORDERED_SUBTASKS),
+]
+
+
+class OrderedSubtask(BaseModel):
+    """Durable ordered work unit; it never stores executable Android refs."""
+
+    id: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+    instruction: str = Field(min_length=1, max_length=2000)
+    position: int = Field(ge=1, le=MAX_ORDERED_SUBTASKS)
+    status: SubtaskStatus = SubtaskStatus.QUEUED
+    task_spec: TaskSpec | None = None
+    contract_status: TaskContractStatus | None = None
+    contract_errors: list[str] = Field(default_factory=list)
+    requirements: dict[str, RequirementStatus] = Field(default_factory=dict)
+    requirement_evidence: dict[str, dict[str, object]] = Field(default_factory=dict)
+    result: dict[str, object] | None = None
+    failure_reason: str | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    step_number: int = 0
+    input_history: list[TaskInputAnswer] = Field(default_factory=list)
+
+
+def build_ordered_subtasks(subtasks: list[SubtaskRequest] | None) -> list[OrderedSubtask]:
+    """Validate and freeze caller ordering before a durable task is queued."""
+    if subtasks is None:
+        return []
+    if not subtasks:
+        raise ValueError("subtasks must be omitted or contain at least one item")
+    if len(subtasks) > MAX_ORDERED_SUBTASKS:
+        raise ValueError(f"subtasks may contain at most {MAX_ORDERED_SUBTASKS} items")
+    normalized = [SubtaskRequest.model_validate(item) for item in subtasks]
+    supplied_ids = [item.id for item in normalized if item.id is not None]
+    if len(supplied_ids) != len(set(supplied_ids)):
+        raise ValueError("subtask IDs must be unique")
+    used_ids = set(supplied_ids)
+    result: list[OrderedSubtask] = []
+    for position, item in enumerate(normalized, start=1):
+        subtask_id = item.id
+        if subtask_id is None:
+            while True:
+                candidate = f"subtask-{uuid4().hex}"
+                if candidate not in used_ids:
+                    subtask_id = candidate
+                    break
+        used_ids.add(subtask_id)
+        result.append(OrderedSubtask(id=subtask_id, instruction=item.instruction, position=position))
+    return result
 
 
 class FieldRequirement(BaseModel):
@@ -149,6 +233,9 @@ class TaskSpec(BaseModel):
     policy: TaskPolicy | None = None
     requested_outputs: list[RequestedOutput] = Field(default_factory=list, max_length=12)
     information_requests: list[InformationRequest] = Field(default_factory=list, max_length=12)
+
+
+OrderedSubtask.model_rebuild()
 
 
 def validate_task_contract(task_spec: TaskSpec) -> TaskContractValidation:

@@ -17,6 +17,24 @@ the task becomes `unsupported` without entering the device execution loop.
 `get_task` exposes a safe contract summary. It does not expose executable UI
 references, Accessibility trees, coordinates, or backend handles.
 
+## Optional ordered subtasks
+
+`start_task` accepts an optional bounded `subtasks` list. Every item contains a
+high-level instruction and may contain a caller-defined stable ID. Missing IDs
+are generated once before the task is queued. The submitted order is durable.
+
+Subtasks remain inside one parent `task_id`, one worker claim at a time and one
+cancellation/safety boundary. The worker resolves and verifies the active
+subtask contract, checkpoints its requirements and evidence, then requeues the
+same parent task for a fresh observation before advancing. A crash resumes the
+same active subtask. `WAITING_FOR_USER` also remains attached to that subtask,
+while `answer_task` only stores the answer and requeues the parent.
+
+The v1 model is sequential: it has no dependency graph, parallel Android
+control or independently leased child tasks. Supplied subtasks refine the
+overall goal but cannot weaken policy, grounding, approval or mutation-safety
+checks.
+
 ## Verified results
 
 A successful run persists semantic evidence for every required criterion.

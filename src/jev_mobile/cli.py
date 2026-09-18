@@ -26,7 +26,7 @@ from .tracing.trace import TraceWriter
 from .agent.mobile_agent import MobileAgent
 from .runtime.worker import DurableWorker
 from .task_store import TaskStatus, TaskStore
-from .tasks import task_spec_from_goal
+from .tasks import SubtaskStatus, task_spec_from_goal
 
 app = typer.Typer(no_args_is_help=True)
 task_app = typer.Typer(no_args_is_help=True)
@@ -187,6 +187,12 @@ def task_cancel(task_id: str) -> None:
         if task.status == TaskStatus.WAITING_FOR_USER:
             from datetime import UTC, datetime
             task.status, task.finished_at = TaskStatus.CANCELLED, datetime.now(UTC)
+            for subtask in task.subtasks:
+                if subtask.status in {
+                    SubtaskStatus.QUEUED, SubtaskStatus.RUNNING, SubtaskStatus.WAITING_FOR_USER,
+                }:
+                    subtask.status = SubtaskStatus.CANCELLED
+                    subtask.finished_at = task.finished_at
         store.save(task); store.event(task_id, "TASK_CANCELLATION_REQUESTED", {})
         if task.status == TaskStatus.CANCELLED: store.event(task_id, "TASK_CANCELLED", {})
     typer.echo(f"{task_id}\tcancellation_requested")

@@ -256,7 +256,7 @@ OpenClaw. It delegates a durable task to the local worker; it does not expose
 Android controls:
 
 ```text
-start_task(instruction)
+start_task(instruction, subtasks?)
 get_task(task_id)
 get_task_events(task_id, after_seq)
 cancel_task(task_id)
@@ -264,11 +264,17 @@ answer_task(task_id, question_id, answer)
 get_device_status()
 ```
 
-Configure an MCP client to launch `jev-mobile-mcp` with the same
-`JEV_MOBILE_DB` as the worker. The server is intentionally stdio-based: an
-OpenClaw client owns its connection, while the worker continues independently
-if that client disconnects or restarts. No public tool performs tap, swipe,
-type, or raw accessibility operations.
+`subtasks` is an optional ordered list of high-level instructions with optional
+stable IDs. Jev Mobile executes exactly one subtask at a time under the same
+parent task ID; each must be observably verified before the next begins. The
+parent can disconnect, reconnect, inspect bounded progress, answer a question,
+or cancel the complete sequence. Parallel subtasks and Android-level commands
+are deliberately not part of this contract.
+
+Configure either stdio or Streamable HTTP with the same `JEV_MOBILE_DB` as the
+worker. The worker continues independently if an MCP client or server
+disconnects or restarts. No public tool performs tap, swipe, type, or raw
+accessibility operations.
 
 ## Docker deployment
 
