@@ -52,10 +52,12 @@ async def run_one(command: list[str], instruction: str, timeout: float) -> dict[
             result = task.get("result") if isinstance(task.get("result"), dict) else {}
             event_rows = events.get("events", [])
             return {"task_id": task_id, "status": status, "duration_ms": round((time.monotonic()-started)*1000),
-                    "steps": int(task.get("steps", 0)), "jev_calls": sum(1 for e in event_rows if e.get("event_type") == "ACTION_SELECTED"),
-                    "recoveries": sum(1 for e in event_rows if "RECOVERY" in str(e.get("event_type"))),
-                    "waiting_count": sum(1 for e in event_rows if e.get("event_type") == "TASK_WAITING_FOR_USER"),
-                    "verified": bool(result.get("verified", status == "succeeded")), "failure_reason": task.get("failure"), "task": task}
+                    "steps": int(result.get("steps", 0)),
+                    "jev_calls": sum(1 for e in event_rows if e.get("type") == "action_selected"),
+                    "recoveries": sum(1 for e in event_rows if "recovery" in str(e.get("type"))),
+                    "waiting_count": sum(1 for e in event_rows if e.get("type") == "task_waiting_for_user"),
+                    "verified": bool(result.get("verified", status == "succeeded")),
+                    "failure_reason": result.get("failure") or task.get("failure"), "task": task}
         await asyncio.sleep(1)
     return {"task_id": task_id, "status": "timeout", "duration_ms": round((time.monotonic()-started)*1000),
             "steps": 0, "jev_calls": 0, "recoveries": 0, "waiting_count": 0, "verified": False, "failure_reason": "benchmark timeout", "task": {}}
