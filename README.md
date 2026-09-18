@@ -10,10 +10,6 @@ An autonomous, durable Android sub-agent with [TypeSafe Jev](https://typesafe.ai
 
 > **Safety boundary.** Durable Core V1 has been hardware-validated for normal notes/checklists, text input, crash recovery, persistence verification and foreign-editor protection. It deliberately stops rather than clearing unrelated application state. Payments, account changes and other sensitive operations remain out of scope without explicit policy/approval work.
 
-![Terminal demo of a Jev-controlled Android Settings navigation task](demo_cli.gif)
-
-_Add `demo_cli.gif` at the repository root to show the live CLI recording._
-
 ## Why this exists
 
 Traditional mobile-agent stacks repeatedly involve a large model in every UI step:
@@ -28,11 +24,11 @@ The high-frequency loop remains local and structured:
 High-level goal
        │
        ▼
-┌──────────────────────────────────────────────────┐
-│ jev-mobile                                       │
-│ durable worker: observe → normalize → requirements│
-│ → valid actions → Jev → journal → verify         │
-└──────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────┐
+│ jev-mobile                                         │
+│ durable worker: observe → normalize → requirements │
+│ → valid actions → Jev → journal → verify           │
+└────────────────────────────────────────────────────┘
        │
        ├── Portal ADB / USB Android runtime
        └── Escalation for uncertainty or risk
