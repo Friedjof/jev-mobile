@@ -162,6 +162,16 @@ async def answer_task(task_id: str, question_id: str, answer: str) -> dict[str, 
 def _public_result(task) -> dict[str, object] | None:
     if not task.result:
         if task.status == TaskStatus.FAILED:
+            if task.failure_reason == "NO_VERIFIABLE_COMPLETION_CRITERIA":
+                return {
+                    "status": "failed",
+                    "failure": {
+                        "category": "UNSUPPORTED_TASK",
+                        "reason": "NO_VERIFIABLE_COMPLETION_CRITERIA",
+                        "message": "The task could not be executed because it has no observable completion criteria.",
+                        "recoverable": True,
+                    },
+                }
             if task.failure_reason == "ORIENTATION_BLOCKED_BY_PERSISTED_APP_STATE":
                 return {
                     "status": "failed",

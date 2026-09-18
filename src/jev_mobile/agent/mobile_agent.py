@@ -16,6 +16,7 @@ from ..device.adapter import DeviceAdapter
 from ..perception import ActionCatalog, SnapshotRefRegistry
 from ..providers.base import ProviderUnavailable
 from ..requirements import RequirementEvaluator
+from ..requirements.generators import generate_requirements
 from ..state.normalize import normalize
 from ..task_store import MobileTask, TaskStatus, TaskStore
 from ..tasks import RequirementStatus, TaskSpec, task_spec_from_goal
@@ -42,6 +43,17 @@ class MobileAgent:
         task = self.store.get(task_id)
         if not task or task.status in {TaskStatus.CANCELLED, TaskStatus.SUCCEEDED, TaskStatus.FAILED}: return
         task.status, task.started_at = TaskStatus.RUNNING, task.started_at or datetime.now(UTC); self.store.save(task)
+        declared_requirements = [item for item in generate_requirements(task.task_spec) if item.required]
+        if not declared_requirements:
+            task.status = TaskStatus.FAILED
+            task.failure_reason = "NO_VERIFIABLE_COMPLETION_CRITERIA"
+            task.finished_at = datetime.now(UTC)
+            self.store.save(task)
+            self.store.event(task.id, "NO_VERIFIABLE_COMPLETION_CRITERIA", {
+                "intent": task.task_spec.intent,
+                "reason": "The task contract contains no required observable completion criteria.",
+            }, task.worker_id)
+            return
         refs, journal, evaluator, history = SnapshotRefRegistry(), MutationJournal(), RequirementEvaluator(), []
         persistence_list_seen = False
         trace = TraceWriter(self.settings.trace_dir)
@@ -175,7 +187,8 @@ class MobileAgent:
                     task.step_number = step
                     task.agent_context = {**task.agent_context, "snapshot": catalog.snapshot_id, "subgoal": task.current_subgoal, "interaction_context": interaction_context.value, "entity_ownership": ownership.value, "orientation": orientation, "orientation_evidence": safe_creation}
                     self.store.save(task); self.store.event(task.id, "SNAPSHOT_OBSERVED", {"step": step, "snapshot": catalog.snapshot_id})
-                    if all(r.status == RequirementStatus.SATISFIED for r in requirements if r.required):
+                    required_requirements = [r for r in requirements if r.required]
+                    if required_requirements and all(r.status == RequirementStatus.SATISFIED for r in required_requirements):
                         task.status = TaskStatus.SUCCEEDED
                         task.result = {"summary": "Task completed and verified.", "requirements": {r.key: r.model_dump(mode="json") for r in requirements}, "steps": step, "trace_path": str(trace.path)}
                         break

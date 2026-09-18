@@ -24,3 +24,24 @@ def test_persisted_foreign_app_state_is_a_safety_boundary() -> None:
             "recoverable": False,
         },
     }
+
+
+def test_unverifiable_task_never_claims_verified_success() -> None:
+    task = MobileTask(
+        id="task-unverifiable",
+        instruction="read something",
+        task_spec=TaskSpec(),
+        created_at=datetime.now(UTC),
+        status=TaskStatus.FAILED,
+        failure_reason="NO_VERIFIABLE_COMPLETION_CRITERIA",
+    )
+
+    assert _public_result(task) == {
+        "status": "failed",
+        "failure": {
+            "category": "UNSUPPORTED_TASK",
+            "reason": "NO_VERIFIABLE_COMPLETION_CRITERIA",
+            "message": "The task could not be executed because it has no observable completion criteria.",
+            "recoverable": True,
+        },
+    }
