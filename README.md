@@ -94,7 +94,7 @@ Requirements:
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/)
 - An Android device with USB debugging enabled
-- A `TYPESAFE_API_KEY` for the Jev provider
+- A TypeSafe API key for the Jev provider
 
 ```bash
 git clone https://github.com/Friedjof/jev-mobile.git
@@ -108,6 +108,10 @@ Set only the credentials you use in `.env`. Never commit this file.
 ```dotenv
 TYPESAFE_API_KEY=...
 ```
+
+For services, prefer `TYPESAFE_API_KEY_FILE=/run/secrets/...`. A configured
+secret file takes precedence over the legacy direct variable, is trimmed when
+read, and fails closed when it is missing, empty, or unreadable.
 
 ## CLI
 
@@ -271,23 +275,38 @@ type, or raw accessibility operations.
 ## Docker deployment
 
 Docker is the primary deployment backend; the native systemd worker remains an
-installed, disabled fallback. The worker is the only container with USB/ADB access. The MCP
-container is stdio-only and reads the shared SQLite task store without an ADB
-key, USB mount, published port, Docker socket, or device cgroup permission.
+installed, disabled fallback. The worker is the only container with USB/ADB
+access. The stdio and Streamable HTTP MCP containers read the shared SQLite
+task store without a provider credential, ADB key, USB mount, Docker socket, or
+device cgroup permission.
 
-Create a secret-bearing runtime environment file outside the repository from
+Create a non-secret worker environment file outside the repository from
 [`deploy/docker/jev-mobile.env.example`](deploy/docker/jev-mobile.env.example),
-then export these host-specific paths before starting Compose:
+and a TypeSafe secret file readable by the container user. Export these
+host-specific paths before starting Compose:
 
 ```bash
 export JEV_MOBILE_ENV_FILE="$HOME/.config/jev-mobile/docker.env"
+export JEV_MOBILE_MCP_ENV_FILE="$HOME/.config/jev-mobile/mcp.env"
+export JEV_MOBILE_TYPESAFE_API_KEY_FILE="$HOME/.config/jev-mobile/secrets/typesafe_api_key"
 export JEV_MOBILE_DATA_DIR="$HOME/.local/share/jev-mobile"
 export JEV_MOBILE_ADB_KEYS_DIR="$HOME/.android"
 export JEV_MOBILE_UID="$(id -u)"
 export JEV_MOBILE_GID="$(id -g)"
 export JEV_MOBILE_USB_GID="$(getent group plugdev | cut -d: -f3)"
-docker compose up -d worker
+docker compose -f docker-compose.yml -f deploy/docker/compose.secrets.yml up -d worker
 ```
+
+The worker receives the provider key as `/run/secrets/typesafe_api_key`; the
+MCP roles use their separate, non-secret environment file and never receive
+that mount. `docker inspect` therefore shows only the secret-file path, not the
+credential. Rotate the key by replacing the host file and recreating only the
+worker container.
+
+The worker sets `ANDROID_USER_HOME=/data/adb` and
+`ADB_VENDOR_KEYS=/data/adb/adbkey`. Startup readiness validates that the state
+directory is readable/writable and that the private key is readable before any
+task can be claimed. ADB no longer depends on a writable `/home/jev`.
 
 `JEV_MOBILE_DATA_DIR` must be a local filesystem because SQLite WAL is not
 safe on NFS or SMB. The worker healthcheck runs `jev-mobile health`, which
@@ -295,8 +314,8 @@ checks its runtime and SQLite only. Device availability is exposed separately
 through `get_device_status`; an unplugged phone does not restart the worker.
 No service exposes ADB over TCP.
 
-For an MCP parent that launches stdio servers, use the same external env file
-and data directory, for example:
+For an MCP parent that launches stdio servers, use the non-secret MCP role file
+and the same data directory, for example:
 
 ```bash
 docker compose run --rm -T mcp

@@ -15,9 +15,13 @@ services:
       JEV_MOBILE_DB: /data/jev-mobile.db
       TRACE_DIR: /data/traces
       HOME: /home/jev
+      # ADB identity/state is intentionally independent of HOME so arbitrary
+      # numeric container users work with a read-only image home directory.
+      ANDROID_USER_HOME: /data/adb
+      ADB_VENDOR_KEYS: /data/adb/adbkey
     volumes:
       - ${JEV_MOBILE_DATA_DIR:?Set JEV_MOBILE_DATA_DIR to a local host directory}:/data:rw
-      - ${JEV_MOBILE_ADB_KEYS_DIR:?Set JEV_MOBILE_ADB_KEYS_DIR to the host ADB key directory}:/home/jev/.android:rw
+      - ${JEV_MOBILE_ADB_KEYS_DIR:?Set JEV_MOBILE_ADB_KEYS_DIR to the host ADB key directory}:/data/adb:rw
       - /dev/bus/usb:/dev/bus/usb:rw
     device_cgroup_rules:
       - "c 189:* rmw"
@@ -45,7 +49,8 @@ services:
     tty: false
     init: true
     env_file:
-      - ${JEV_MOBILE_ENV_FILE:?Set JEV_MOBILE_ENV_FILE to an external env file}
+      # This role-specific file must contain no provider credentials.
+      - ${JEV_MOBILE_MCP_ENV_FILE:-deploy/docker/mcp.env.example}
     environment:
       JEV_MOBILE_DB: /data/jev-mobile.db
       HOME: /home/jev
@@ -66,7 +71,8 @@ services:
     restart: unless-stopped
     init: true
     env_file:
-      - ${JEV_MOBILE_ENV_FILE:?Set JEV_MOBILE_ENV_FILE to an external env file}
+      # This role-specific file must contain no provider credentials.
+      - ${JEV_MOBILE_MCP_ENV_FILE:-deploy/docker/mcp.env.example}
     environment:
       JEV_MOBILE_DB: /data/jev-mobile.db
       HOME: /home/jev

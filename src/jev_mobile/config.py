@@ -9,6 +9,29 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 
+def read_secret(environment_name: str) -> tuple[str | None, str | None]:
+    """Read one secret without ever including its value in diagnostics.
+
+    ``*_FILE`` deliberately takes precedence over the legacy direct variable.
+    This lets a deployment migrate to Docker secrets even if an old variable
+    is still present.  A configured but unreadable file fails closed instead
+    of silently falling back to the inspect-visible environment value.
+    """
+    file_name = f"{environment_name}_FILE"
+    configured_path = os.getenv(file_name)
+    if configured_path:
+        path = Path(configured_path)
+        try:
+            value = path.read_text(encoding="utf-8").strip()
+        except OSError as error:
+            return None, f"PROVIDER_SECRET_UNREADABLE: {file_name}={path}: {error.strerror or type(error).__name__}"
+        if not value:
+            return None, f"PROVIDER_SECRET_EMPTY: {file_name}={path} contains no secret"
+        return value, None
+    value = (os.getenv(environment_name) or "").strip()
+    return (value or None), None
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     mobile_mcp_command: tuple[str, ...]
@@ -40,10 +63,12 @@ class Settings:
     bridge_port: int = 8765
     bridge_token: str | None = None
     text_input_strategy: str = "accessibility"
+    configuration_errors: tuple[str, ...] = ()
 
     @classmethod
     def from_env(cls) -> "Settings":
         load_dotenv()
+        typesafe_api_key, typesafe_error = read_secret("TYPESAFE_API_KEY")
         command = os.getenv("MOBILE_MCP_COMMAND_JSON", '["npx", "-y", "@mobilenext/mobile-mcp@1.0.4"]')
         try:
             parsed = tuple(json.loads(command)) if command else ()
@@ -80,9 +105,10 @@ class Settings:
             llm_base_url=os.getenv("LLM_BASE_URL") or None,
             llm_api_key=os.getenv("LLM_API_KEY") or None,
             llm_model=os.getenv("LLM_MODEL") or None,
-            typesafe_api_key=os.getenv("TYPESAFE_API_KEY") or None,
+            typesafe_api_key=typesafe_api_key,
             agent_system_prompt=os.getenv("MOBILE_AGENT_SYSTEM_PROMPT") or None,
             bridge_port=int(os.getenv("JEV_MOBILE_BRIDGE_PORT", "8765")),
             bridge_token=os.getenv("JEV_MOBILE_BRIDGE_TOKEN") or None,
             text_input_strategy=text_input_strategy,
+            configuration_errors=tuple(error for error in (typesafe_error,) if error),
         )
