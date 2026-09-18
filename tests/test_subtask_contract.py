@@ -10,6 +10,7 @@ from jev_mobile import mcp_server
 from jev_mobile.agent.mobile_agent import MobileAgent
 from jev_mobile.config import Settings
 from jev_mobile.providers.mock import MockProvider
+from jev_mobile.providers.base import ProviderUnavailable
 from jev_mobile.state.models import RawDeviceState
 from jev_mobile.task_store import TaskStore
 from jev_mobile.task_store import TaskStatus
@@ -53,6 +54,17 @@ def _open_spec() -> TaskSpec:
 def _subtask_agent(store: TaskStore, tmp_path) -> MobileAgent:
     settings = Settings((), None, tmp_path / "traces", 0.01, 0.1, 0.8)
     return MobileAgent(store, _ObservedApp, MockProvider(), settings)
+
+
+class _RecordingProvider:
+    name = "recording"
+
+    def __init__(self) -> None:
+        self.agent_context = None
+
+    async def decide(self, goal, state, actions):
+        self.agent_context = state.agent_context
+        raise ProviderUnavailable("defer after recording context")
 
 
 def test_ordered_subtasks_are_validated_and_persisted(tmp_path) -> None:
@@ -305,3 +317,32 @@ async def test_failed_required_subtask_fails_parent_and_does_not_run_later_work(
         event["event_type"] == "SUBTASK_STARTED" and event["payload"]["subtask_id"] == "must-not-run"
         for event in store.events(task.id)
     )
+
+
+@pytest.mark.asyncio
+async def test_verified_prior_result_is_semantic_context_for_next_subtask(tmp_path) -> None:
+    _ObservedApp.enters = 0
+    store = TaskStore(tmp_path / "tasks.sqlite3")
+    subtasks = build_ordered_subtasks([
+        SubtaskRequest(id="completed", instruction="Open Example"),
+        SubtaskRequest(id="next", instruction="Open Other"),
+    ])
+    subtasks[0].task_spec = _open_spec()
+    subtasks[0].contract_status = TaskContractStatus.READY
+    subtasks[1].task_spec = _open_spec().model_copy(update={
+        "app": "Other",
+        "app_package": "com.example.other",
+        "completion": [CompletionRequirement(type="app_open", value="com.example.other")],
+    })
+    subtasks[1].contract_status = TaskContractStatus.READY
+    task = store.create("Run in order", TaskSpec(), subtasks)
+    provider = _RecordingProvider()
+    settings = Settings((), None, tmp_path / "traces", 0.01, 0.1, 0.8)
+    agent = MobileAgent(store, _ObservedApp, provider, settings)
+
+    await agent.run(task.id)
+    await agent.run(task.id)
+
+    assert provider.agent_context is not None
+    assert provider.agent_context["subtask"] == {"id": "next", "position": 2, "total": 2}
+    assert provider.agent_context["completed_subtasks"][0]["id"] == "completed"
