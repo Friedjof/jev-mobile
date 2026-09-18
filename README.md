@@ -2,13 +2,13 @@
 
 [![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Status](https://img.shields.io/badge/status-proof--of--concept-8A2BE2)](#project-status)
+[![Status](https://img.shields.io/badge/status-durable--core--v1-16803C)](#project-status)
 
-Fast, structured Android control loops with [TypeSafe Jev](https://typesafe.ai/) as a pluggable decision provider.
+An autonomous, durable Android sub-agent with [TypeSafe Jev](https://typesafe.ai/) as its System-One decision provider.
 
-`jev-mobile` turns a high-level mobile goal into a bounded **observe → stabilize → decide → act** loop. Jev receives a compact semantic UI state and a small list of already-valid actions. It never generates coordinates, MCP calls, or arbitrary code.
+`jev-mobile` accepts a high-level task, persists it in SQLite, and lets one durable worker execute **observe → normalize → decide → mutate → verify** against a USB-connected Android device. Jev receives concise semantics and technically valid actions; it never generates coordinates, MCP calls, or arbitrary code.
 
-> **Proof of concept.** This project has been exercised against Android Settings on a real device. It is not yet a general-purpose autonomous mobile agent and must not be used for payments, account changes, destructive actions, or other sensitive workflows.
+> **Safety boundary.** Durable Core V1 has been hardware-validated for normal notes/checklists, text input, crash recovery, persistence verification and foreign-editor protection. It deliberately stops rather than clearing unrelated application state. Payments, account changes and other sensitive operations remain out of scope without explicit policy/approval work.
 
 ![Terminal demo of a Jev-controlled Android Settings navigation task](demo_cli.gif)
 
@@ -22,7 +22,7 @@ Traditional mobile-agent stacks repeatedly involve a large model in every UI ste
 LLM → mobile tool → LLM → mobile tool → LLM
 ```
 
-This PoC keeps the high-frequency loop fast and structured instead:
+The high-frequency loop remains local and structured:
 
 ```text
 High-level goal
@@ -30,68 +30,62 @@ High-level goal
        ▼
 ┌──────────────────────────────────────────────────┐
 │ jev-mobile                                       │
-│  observe → wait for stable UI → normalize        │
-│  → build valid actions → Jev → execute           │
+│ durable worker: observe → normalize → requirements│
+│ → valid actions → Jev → journal → verify         │
 └──────────────────────────────────────────────────┘
        │
-       ├── Mobile MCP / Android device
+       ├── Portal ADB / USB Android runtime
        └── Escalation for uncertainty or risk
 ```
 
 For example, Jev sees only this decision problem:
 
 ```text
-Goal: Open Display settings
+Task: Create a note titled Shopping
 
 Valid actions:
-  A1  Tap "Display"
-  A2  Go back
-  A3  Wait for UI
-  A4  Escalate
+  A1  Create entity
+  A2  Set title in title field
+  A3  Verify persisted result
 
-Jev → A1, confidence=0.99
+Jev → A1
 ```
 
-The controller maps `A1` to the actual Mobile MCP call. Invalid actions and invented coordinates are impossible by construction.
+The worker maps `A1` to the backend through the DeviceAdapter. Invalid actions, stale snapshot references and invented coordinates are rejected by construction.
 
 ## Demo
 
-The current real-device demo is read-only Android Settings navigation:
+The primary real-device path is durable task delegation:
 
 ```bash
-uv run jev-mobile run \
-  --goal "Open Display settings, then return to the Settings main screen" \
-  --provider jev \
-  --serial YOUR_ANDROID_SERIAL \
-  --start-app com.android.settings
+uv run jev-mobile worker --backend portal-adb --serial YOUR_ANDROID_SERIAL
+uv run jev-mobile task start "Create a Google Keep checklist titled Shopping with Eier, Brot and Milch"
 ```
 
-The live CLI shows the current stable UI, candidate actions, Jev confidence and probability margin, the executed action, and final completion or escalation.
+The task command returns a task id immediately. The worker owns subsequent
+Android actions and reports progress, evidence and final verification through
+`task get`, `task events` and MCP.
 
 ## Project status
 
 ### Working now
 
-- Android control through the external [Mobile Next Mobile MCP](https://github.com/mobile-next/mobile-mcp) backend
-- Semantic UI normalization, fingerprints, loading detection, and adaptive stability polling
-- Structured TypeSafe System-One choices through the official asynchronous Python SDK
-- Pluggable `jev`, `system-one-llm`, `heuristic`, and `mock` decision providers
-- Confidence and top-two probability-margin safety gates
-- Bounded loops, repeated-state detection, escalation checkpoints, and JSONL traces
-- Ranked action pages that prevent crowded screens from overwhelming Jev
-- Conservative popup detection with safe dismissal or screenshot-backed escalation
-- Human-friendly `devices`, `inspect`, `decide`, and `run` CLI output
-- An in-repository Android Accessibility Bridge PoC with real node actions and
-  USB-only ADB forwarding (manual service enablement required)
-- A durable SQLite-backed worker and a stdio MCP delegation surface
+- Local USB-only `PortalAdbDeviceAdapter`; no Mobilerun cloud/account/API
+- Semantic UI normalization, snapshot-bound references and technical action catalogs
+- TypeSafe Jev decisioning with requirement-driven subgoals
+- Mutation journaling before execution plus observation-based reconciliation
+- Durable SQLite tasks, leases, checkpoints, cancellation and worker recovery
+- Independent persistence verification and foreign-entity write protection
+- Scoped approval for risky lifecycle recovery and safe terminal boundaries
+- Public stdio MCP task delegation and a deterministic Android acceptance fixture
 
 ### Deliberately not solved yet
 
-- General app understanding beyond the Settings-focused PoC
-- Vision-first or screenshot-driven navigation
-- Reliable text-search handling across all Android variants
-- Human approval UX, task resume CLI, benchmarking dashboard, and OpenClaw integration
-- A hosted service
+- Broad app coverage beyond the validated Keep/fixture scenarios
+- Vision-first navigation and richer visual reasoning
+- Advanced recovery/exploration and benchmark dashboards
+- OpenClaw-specific registration (the generic MCP contract is ready)
+- A hosted/cloud service
 
 ## Installation
 
@@ -100,7 +94,6 @@ Requirements:
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/)
 - An Android device with USB debugging enabled
-- Node.js / `npx` for the default Mobile MCP transport
 - A `TYPESAFE_API_KEY` for the Jev provider
 
 ```bash
@@ -116,39 +109,26 @@ Set only the credentials you use in `.env`. Never commit this file.
 TYPESAFE_API_KEY=...
 ```
 
-The default Mobile MCP command is started through `npx`. To install it globally instead:
-
-```bash
-npm install -g @mobilenext/mobile-mcp@1.0.4
-```
-
 ## CLI
 
 ```bash
-# Discover Android devices through Mobile MCP.
-uv run jev-mobile devices
+# Run one worker for one physical USB device.
+uv run jev-mobile worker --backend portal-adb --serial YOUR_ANDROID_SERIAL
 
-# Read the current UI and show safe candidate actions. No device action.
-uv run jev-mobile inspect --serial YOUR_ANDROID_SERIAL
+# Queue and inspect a durable task.
+uv run jev-mobile task start "Create a Google Keep note titled Test with body Hello World"
+uv run jev-mobile task get TASK_ID
+uv run jev-mobile task events TASK_ID
+uv run jev-mobile task cancel TASK_ID
 
-# Ask Jev for one action. This is always a dry run.
-uv run jev-mobile decide \
-  --goal "Open Display settings" \
-  --provider jev \
-  --serial YOUR_ANDROID_SERIAL
-
-# Execute a bounded navigation loop.
-uv run jev-mobile run \
-  --goal "Open Display settings, then return to the Settings main screen" \
-  --provider jev \
-  --serial YOUR_ANDROID_SERIAL \
-  --start-app com.android.settings
+# Worker health is independent from device availability.
+uv run jev-mobile health
 ```
 
-### Accessibility Bridge PoC
+### Alternative Android backends
 
-Mobile MCP remains the default backend. For richer Android semantics, this
-repository now also contains a tiny first-party companion app under
+`portal-adb` is the primary local USB backend. The repository also contains a
+tiny first-party companion app under
 [`android/jev-mobile-bridge`](android/jev-mobile-bridge). It runs an Android
 `AccessibilityService` and gives the controller real node capabilities such as
 `CLICK`, `SET_TEXT`, check state, hints, resource IDs, window context, and the
@@ -185,9 +165,9 @@ controller never changes the device's default keyboard automatically.
 > `FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES`. Use either Mobile MCP's UI-tree
 > backend or the bridge at a time—not both—until that upstream flag is enabled.
 
-`run` executes read-only navigation and explicitly classified reversible candidates in the current PoC. External-effect and sensitive actions always create an escalation checkpoint. The default confidence threshold is `0.80`; low-confidence or low-margin decisions also create an escalation checkpoint instead of acting.
+The legacy `run` command remains available for controller development. Production tasks use `task start` and the durable worker. External-effect and sensitive actions remain subject to validation and approval policy.
 
-See [current PoC limitations and next steps](docs/current-limitations.md) for the intentionally unfinished areas, including checklist authoring, visual escalation, free-form text generation, and durable resume.
+See [current limitations and next steps](docs/current-limitations.md) for intentionally unfinished areas such as visual escalation and broader app support.
 
 Crowded screens are presented in ranked pages (10 device actions by default). Choosing `More actions` advances locally to the next page without touching the phone. A clearly safe popup dismissal may be executed. Every detected modal also offers `Dismiss popup with Back`; permission prompts, confirmations, and unknown dialogs never expose an accept/continue action and retain escalation as a safe alternative.
 
@@ -254,33 +234,14 @@ uv run python scripts/test_jev.py
 
 The smoke test requires `TYPESAFE_API_KEY` and intentionally logs only selected action, probabilities, latency, model name, and token accounting.
 
-## Docker MCP server
-
-The repository ships a stdio MCP image. It exposes the same bounded controller
-operations as the CLI; it does not expose arbitrary ADB commands or coordinate
-taps. A container still needs deliberate access to an ADB server and the
-Android bridge when it is used with a real phone.
-
-```bash
-docker build -t jev-mobile-mcp .
-docker run -i --rm \
-  -e TYPESAFE_API_KEY \
-  -e MOBILE_DEVICE_SERIAL \
-  jev-mobile-mcp
-```
-
-The process communicates over standard input/output, as required by MCP. For
-the bridge backend, provide ADB connectivity explicitly; do not bake USB
-permissions, device serials, or credentials into the image.
-
 ## CI and releases
 
-- Android bridge changes run Android lint and produce a debug APK artifact.
+- Android bridge and fixture changes run Android lint/build and produce a debug APK artifact.
 - Python/controller changes run Ruff, tests, an MCP-tool smoke test, and build
   the container image. Pushes publish branch and SHA tags to GHCR.
 - Pushing a tag shaped as `vX.Y.Z` runs both test suites, publishes
   `ghcr.io/<owner>/jev-mobile-mcp` with version and `latest` tags, and creates
-  a GitHub Release containing the installable PoC debug APK.
+  a GitHub Release containing the installable debug APK.
 
 The release APK is deliberately debug-signed while this project remains a PoC.
 Introduce a protected Android signing-key workflow before distributing a
@@ -329,8 +290,9 @@ docker compose up -d worker
 ```
 
 `JEV_MOBILE_DATA_DIR` must be a local filesystem because SQLite WAL is not
-safe on NFS or SMB. The worker healthcheck runs `jev-mobile doctor`; an
-unplugged device makes it unhealthy but does not by itself restart the worker.
+safe on NFS or SMB. The worker healthcheck runs `jev-mobile health`, which
+checks its runtime and SQLite only. Device availability is exposed separately
+through `get_device_status`; an unplugged phone does not restart the worker.
 No service exposes ADB over TCP.
 
 For an MCP parent that launches stdio servers, use the same external env file

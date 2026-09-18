@@ -1,28 +1,24 @@
-# Current PoC Limitations and Next Steps
+# Current Limitations and Next Steps
 
-This prototype proves the structured Android control path, but it is not yet a general autonomous mobile agent.
+Durable Core V1 proves a local, autonomous Android task path, but it is not yet
+a general-purpose mobile automation service.
 
 ## What currently works
 
-- Mobile MCP observation and execution through a backend-neutral adapter.
-- Compact semantic UI states, candidate-action paging, UI stabilization, traces, and bounded loops.
-- Native TypeSafe Jev decisions over existing actions only.
-- Optional LLM task planning before execution, LLM recovery planning, and LLM completion review.
-- Settings navigation, launcher-to-Keep-Notes navigation, and deterministic entry of explicitly supplied note text.
-- Conservative dialog handling: safe labelled dismissal or Android Back, never permission acceptance.
+- USB-only Portal/ADB observation and execution through a backend-neutral adapter.
+- Snapshot-bound semantic UI states, requirement-driven subgoals, action validation, traces and bounded recovery.
+- Durable SQLite tasks, worker leases, mutation journaling, crash reconciliation and cooperative cancellation.
+- Unicode-safe text entry, independent persistence verification and a deterministic Android fixture.
+- Autonomous Google Keep checklist and text-note creation from the supported safe starting contexts.
+- Foreign-entity write protection plus durable, scoped approval for risky lifecycle recovery.
 
 ## Known limitations
 
-### Checklist authoring is not yet workflow-complete
+### App coverage is intentionally narrow
 
-The task planner can describe a checklist workflow, but the candidate builder does not yet have an app-specific, verified Keep checklist workflow. In particular, it does not yet reliably:
-
-- select Keep's checklist format when it is hidden behind an app-specific menu;
-- add one item per checkbox row;
-- distinguish a draft editor from an autosaved note;
-- verify an app-specific save indicator or a persisted note after leaving the editor.
-
-The current deterministic text path is appropriate for a plain note with explicit text. A checklist needs structured item-entry support and app-specific semantic verification before it should be considered complete.
+The validated flows cover the fixture app and Google Keep note/checklist
+creation. Other apps, unusual widget sets, inaccessible canvases and complex
+multi-account flows may still require recovery, approval or a safe failure.
 
 ### LLM planning is advisory, not visual control
 
@@ -34,11 +30,23 @@ Explicit text from a task can be entered deterministically. Requests such as “
 
 ### Completion verification remains conservative
 
-The final LLM review evaluates visible semantic UI against plan criteria. It cannot prove an external side effect, a network request, or persistence after an app has hidden the relevant state. Those cases need explicit app-level checks or user approval.
+The worker verifies persisted fixture and Keep content after navigation away
+and reopening. It cannot prove arbitrary external effects such as network
+requests, purchases or side effects that an app does not expose in its UI.
 
-### Recovery and resume are local only
+### Persisted foreign application state is a safety boundary
 
-Escalation creates a JSON checkpoint and optional screenshot. A first-class `mobile_agent_resume` command, human approval workflow, and OpenClaw/MCP-server integration are still future work.
+The worker deliberately refuses to clear app data, preferences or databases.
+If a target app persistently restores unrelated content after safe navigation,
+root entry, task reset and approved process restart, the task ends with the
+structured `SAFETY_BLOCKED / PERSISTED_FOREIGN_APP_STATE` outcome rather than
+risking user data.
+
+### MCP is generic; OpenClaw registration is not done yet
+
+The public stdio MCP surface provides durable task delegation, progress,
+cancellation, device status and answers. OpenClaw-specific registration and
+parent-agent acceptance testing remain future work.
 
 ### Backend constraints
 
@@ -46,8 +54,8 @@ The OpenAI-compatible planner requires a model and endpoint that support JSON-mo
 
 ## Recommended next milestones
 
-1. Implement a verified Keep checklist workflow: create checklist, add rows, verify all rows, and verify persistence.
+1. Validate Docker deployment and real stdio MCP process boundaries on hardware.
 2. Add a vision-capable escalation provider for screenshot-backed inspection.
 3. Add preview-and-approval text generation for unknown text fields.
-4. Build durable resume, approval, and benchmark commands.
-5. Expose the standalone controller as an MCP server for OpenClaw or another orchestrator.
+4. Expand the app benchmark suite and recovery/exploration coverage.
+5. Register the public MCP contract with OpenClaw or another parent agent.
