@@ -22,6 +22,39 @@ class CompletionRequirement(BaseModel):
     type: str = Field(min_length=1, max_length=40)
     field_role: str | None = Field(default=None, max_length=40)
     value: str | None = Field(default=None, max_length=4000)
+    output_key: str | None = Field(default=None, min_length=1, max_length=80)
+
+
+class TaskPolicyMode(StrEnum):
+    READ_ONLY = "read_only"
+    MUTATING = "mutating"
+
+
+class TaskPolicy(BaseModel):
+    """Durable execution constraints, not a provider prompt."""
+
+    mode: TaskPolicyMode
+    external_interactions: bool = False
+    sensitive_data: bool = False
+
+
+class RequestedOutput(BaseModel):
+    """One semantic value the parent expects in the final result."""
+
+    key: str = Field(min_length=1, max_length=80)
+    description: str = Field(min_length=1, max_length=240)
+    required: bool = True
+
+
+class TaskContractStatus(StrEnum):
+    PENDING = "pending"
+    READY = "ready"
+    UNSUPPORTED = "unsupported"
+
+
+class TaskContractValidation(BaseModel):
+    valid: bool
+    errors: list[str] = Field(default_factory=list)
 
 
 class RequirementStatus(StrEnum):
@@ -34,6 +67,7 @@ class RequirementStatus(StrEnum):
 class TaskSpec(BaseModel):
     """Small semantic decomposition supplied by a planner or safe local parsing."""
 
+    contract_version: int = 1
     intent: str = Field(default="generic", max_length=80)
     app: str | None = Field(default=None, max_length=160)
     app_package: str | None = Field(default=None, max_length=240)
@@ -42,6 +76,43 @@ class TaskSpec(BaseModel):
     fields: list[FieldRequirement] = Field(default_factory=list, max_length=6)
     items: list[str] = Field(default_factory=list, max_length=100)
     completion: list[CompletionRequirement] = Field(default_factory=list, max_length=8)
+    policy: TaskPolicy | None = None
+    requested_outputs: list[RequestedOutput] = Field(default_factory=list, max_length=12)
+
+
+def validate_task_contract(task_spec: TaskSpec) -> TaskContractValidation:
+    """Validate the durable semantic boundary before Android is touched."""
+    errors: list[str] = []
+    if task_spec.intent == "generic":
+        errors.append("intent is unresolved")
+    if not (task_spec.app or task_spec.app_package):
+        errors.append("target app is missing")
+    if task_spec.policy is None:
+        errors.append("execution policy is missing")
+    observable = bool(
+        task_spec.completion
+        or any(field.required for field in task_spec.fields)
+        or task_spec.items
+        or (task_spec.intent == "create_note" and task_spec.title)
+    )
+    if not observable:
+        errors.append("observable completion criteria are missing")
+    if task_spec.policy and task_spec.policy.mode == TaskPolicyMode.READ_ONLY and not task_spec.requested_outputs:
+        errors.append("read-only task has no requested outputs")
+    output_keys = [output.key for output in task_spec.requested_outputs]
+    if len(output_keys) != len(set(output_keys)):
+        errors.append("requested output keys must be unique")
+    known_outputs = set(output_keys)
+    referenced_outputs = {item.output_key for item in task_spec.completion if item.output_key}
+    if any(item.output_key and item.output_key not in known_outputs for item in task_spec.completion):
+        errors.append("completion requirement references an unknown output")
+    if any(output.required and output.key not in referenced_outputs for output in task_spec.requested_outputs):
+        errors.append("required output has no completion requirement")
+    return TaskContractValidation(valid=not errors, errors=errors)
+
+
+def contract_status_for(task_spec: TaskSpec) -> TaskContractStatus:
+    return TaskContractStatus.READY if validate_task_contract(task_spec).valid else TaskContractStatus.PENDING
 
 
 class TaskInterpretation(BaseModel):
@@ -86,9 +157,9 @@ class TaskInterpretation(BaseModel):
 
 
 def _unique_completion(values: list[CompletionRequirement]) -> list[CompletionRequirement]:
-    unique: dict[tuple[str, str | None, str | None], CompletionRequirement] = {}
+    unique: dict[tuple[str, str | None, str | None, str | None], CompletionRequirement] = {}
     for value in values:
-        unique[(value.type, value.field_role, value.value)] = value
+        unique[(value.type, value.field_role, value.value, value.output_key)] = value
     return list(unique.values())
 
 
@@ -104,7 +175,9 @@ def task_spec_from_goal(goal: str) -> TaskSpec:
         completion = [CompletionRequirement(type="field_contains", field_role="body", value=body)] if body else []
         if title: completion.append(CompletionRequirement(type="title_equals", value=title))
         completion.append(CompletionRequirement(type="persisted"))
-        return TaskSpec(intent="create_note", app="Jev Mobile Fixture", app_package="io.jev.mobile.fixture", content_type="text_note", title=title, fields=fields, completion=completion)
+        return TaskSpec(intent="create_note", app="Jev Mobile Fixture", app_package="io.jev.mobile.fixture",
+                        content_type="text_note", title=title, fields=fields, completion=completion,
+                        policy=TaskPolicy(mode=TaskPolicyMode.MUTATING))
     # This is language/task parsing only. It never contains UI or app-flow knowledge.
     checklist = "checklist" in normalized or "check list" in normalized
     note_target = "keep" in normalized or "note" in normalized or "notiz" in normalized
@@ -118,7 +191,8 @@ def task_spec_from_goal(goal: str) -> TaskSpec:
             items=items, completion=[CompletionRequirement(type="content_mode", value="checklist"),
                                       CompletionRequirement(type="checklist_items"),
                                       CompletionRequirement(type="title_equals", value=title) if title else CompletionRequirement(type="persisted"),
-                                      CompletionRequirement(type="persisted")])
+                                      CompletionRequirement(type="persisted")],
+            policy=TaskPolicy(mode=TaskPolicyMode.MUTATING))
     if note_target and any(token in normalized for token in ("text note", "normal", "body")):
         title_match = re.search(r"(?:titled|title)\s+[\"']?([^\n\"']+?)[\"']?(?:\s+(?:with|mit)\s+(?:the\s+)?body\s*:?|$)", goal, re.I)
         body_match = re.search(r"(?:body\s*:?|text\s*:)\s*(.+)$", goal, re.I | re.S)
@@ -128,7 +202,9 @@ def task_spec_from_goal(goal: str) -> TaskSpec:
         completion = [CompletionRequirement(type="field_contains", field_role="body", value=body)] if body else []
         if title: completion.append(CompletionRequirement(type="title_equals", value=title))
         completion.append(CompletionRequirement(type="persisted"))
-        return TaskSpec(intent="create_note", app="Google Keep", app_package="com.google.android.keep", content_type="text_note", title=title, fields=fields, completion=completion)
+        return TaskSpec(intent="create_note", app="Google Keep", app_package="com.google.android.keep",
+                        content_type="text_note", title=title, fields=fields, completion=completion,
+                        policy=TaskPolicy(mode=TaskPolicyMode.MUTATING))
     _, separator, supplied = goal.partition(":")
     content = supplied.strip()
     creates_note = any(term in normalized for term in ("new note", "create a note", "notiz", "shopping list"))

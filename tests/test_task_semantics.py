@@ -4,6 +4,7 @@ from jev_mobile.controller.context import AgentContext
 from jev_mobile.controller.navigator import semantic_group
 from jev_mobile.state.models import DialogInfo, DialogKind, SemanticElement, SemanticState
 from jev_mobile.tasks import TaskInterpretation, task_spec_from_goal
+from jev_mobile.requirements import RequirementEvaluator
 
 
 GOAL = "create a new note for shopping: Eier, Brot, Fisch, Frischkäse, Salat, Essig"
@@ -118,3 +119,18 @@ def test_filled_checklist_requests_persistence_transition() -> None:
 
     assert actions[0].kind == ActionKind.BACK
     assert "persisted" in actions[0].label
+
+
+def test_title_requirement_evidence_uses_the_title_role_not_matching_content() -> None:
+    spec = task_spec_from_goal("Create a Google Keep note titled Shopping with body Shopping")
+    state = SemanticState(app="com.google.android.keep", fingerprint="editor", raw_snapshot_id="s5", elements=[
+        _element(id="body", role="text_field", value="Shopping", editable=True, field_role="body"),
+        _element(id="title", role="text_field", value="Shopping", editable=True, field_role="title"),
+    ])
+
+    requirements = RequirementEvaluator().evaluate(spec, state)
+    title = next(requirement for requirement in requirements if requirement.kind == "title_equals")
+
+    assert title.evidence["semantic_role"] == "title"
+    assert title.evidence["observed_value"] == "Shopping"
+    assert "ref" not in title.evidence

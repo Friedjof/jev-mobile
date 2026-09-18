@@ -8,7 +8,7 @@ def generate_requirements(task_spec: TaskSpec) -> list[Requirement]:
     """Make every declared completion condition explicit before planning."""
     values = [Requirement(key="app_open", kind="app_open", expected=task_spec.app_package or task_spec.app)] if task_spec.app else []
     values.extend(
-        Requirement(key=f"completion:{index}", kind=item.type, expected=item.value)
+        Requirement(key=f"completion:{index}", kind=item.type, expected=item.value, output_key=item.output_key)
         for index, item in enumerate(task_spec.completion, start=1)
     )
     values.extend(Requirement(key=f"field:{item.role}", kind="field_contains", expected=item.content,

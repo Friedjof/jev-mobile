@@ -7,6 +7,7 @@ from jev_mobile.config import Settings
 from jev_mobile.providers.mock import MockProvider
 from jev_mobile.task_store import TaskStatus, TaskStore
 from jev_mobile.tasks import TaskSpec
+from jev_mobile.tasks import TaskContractStatus
 
 
 @pytest.mark.asyncio
@@ -33,6 +34,7 @@ async def test_empty_completion_contract_fails_before_device_access(tmp_path) ->
     assert persisted is not None
     assert persisted.status == TaskStatus.FAILED
     assert persisted.failure_reason == "NO_VERIFIABLE_COMPLETION_CRITERIA"
+    assert persisted.contract_status == TaskContractStatus.UNSUPPORTED
     assert persisted.result is None
     assert persisted.finished_at is not None
     assert entered is False

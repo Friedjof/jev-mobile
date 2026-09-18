@@ -28,6 +28,7 @@ from .device.accessibility_adb import AccessibilityAdbAdapter
 from .device.mobile_mcp import MobileMcpAdapter
 from .device.portal_adb import PortalAdbDeviceAdapter
 from .agent.mobile_agent import MobileAgent
+from .requirements.generators import generate_requirements
 from .task_store import TaskStatus, TaskStore
 from .tasks import task_spec_from_goal
 from .providers.heuristic import HeuristicProvider
@@ -111,6 +112,7 @@ async def get_task(task_id: str) -> dict[str, object]:
         "task_id": task.id,
         "status": task.status.value,
         "instruction": task.instruction,
+        "contract": _public_contract(task),
         "current_subgoal": task.current_subgoal,
         "progress": {"requirements_satisfied": sum(status.value == "satisfied" for status in requirements), "requirements_total": len(requirements)},
         "waiting_for_user": task.waiting_question or ({"text": task.waiting_reason} if task.waiting_reason else None),
@@ -162,13 +164,17 @@ async def answer_task(task_id: str, question_id: str, answer: str) -> dict[str, 
 def _public_result(task) -> dict[str, object] | None:
     if not task.result:
         if task.status == TaskStatus.FAILED:
-            if task.failure_reason == "NO_VERIFIABLE_COMPLETION_CRITERIA":
+            if task.failure_reason in {"NO_VERIFIABLE_COMPLETION_CRITERIA", "TASK_CONTRACT_INCOMPLETE"}:
                 return {
                     "status": "failed",
                     "failure": {
                         "category": "UNSUPPORTED_TASK",
-                        "reason": "NO_VERIFIABLE_COMPLETION_CRITERIA",
-                        "message": "The task could not be executed because it has no observable completion criteria.",
+                        "reason": task.failure_reason,
+                        "message": (
+                            "The task could not be executed because it has no observable completion criteria."
+                            if task.failure_reason == "NO_VERIFIABLE_COMPLETION_CRITERIA"
+                            else "The task could not be converted into a complete, safe execution contract."
+                        ),
                         "recoverable": True,
                     },
                 }
@@ -184,7 +190,117 @@ def _public_result(task) -> dict[str, object] | None:
                 }
             return {"status": "failed", "failure": {"category": "AGENT", "message": task.failure_reason or "Task failed", "recoverable": False}}
         return None
-    return {"status": task.status.value, "summary": task.result.get("summary"), "verified": task.status == TaskStatus.SUCCEEDED, "steps": task.result.get("steps", task.step_number)}
+    requirements = task.result.get("requirements", [])
+    safe_requirements = []
+    if isinstance(requirements, list):
+        for requirement in requirements:
+            if not isinstance(requirement, dict):
+                continue
+            evidence = requirement.get("evidence")
+            safe_evidence = _public_evidence(evidence) if isinstance(evidence, dict) else None
+            safe_requirements.append({
+                "key": requirement.get("key"),
+                "kind": requirement.get("kind"),
+                "status": requirement.get("status"),
+                "evidence": safe_evidence,
+            })
+    raw_observations = task.result.get("observations", {})
+    allowed_outputs = {output.key for output in task.task_spec.requested_outputs}
+    observations: dict[str, object] = {}
+    if isinstance(raw_observations, dict):
+        for key in allowed_outputs:
+            value = raw_observations.get(key)
+            if not isinstance(value, dict):
+                continue
+            observations[key] = {
+                "status": value.get("status") if value.get("status") in {"observed", "unknown", "unavailable"} else "unknown",
+                "value": _safe_observed_value(value.get("value")),
+            }
+    required_keys = {requirement.key for requirement in generate_requirements(task.task_spec) if requirement.required}
+    result_keys = {str(requirement.get("key")) for requirement in safe_requirements}
+    durable_requirements_complete = all(
+        task.requirements.get(key) is not None and task.requirements[key].value == "satisfied"
+        for key in required_keys
+    )
+    evidence_complete = (
+        bool(required_keys)
+        and required_keys == result_keys
+        and all(
+            requirement.get("status") == "satisfied"
+            and isinstance(requirement.get("evidence"), dict)
+            and bool(requirement["evidence"].get("source"))
+            for requirement in safe_requirements
+        )
+        and durable_requirements_complete
+    )
+    outputs_complete = all(
+        not output.required
+        or isinstance(observations.get(output.key), dict)
+        and observations[output.key].get("status") == "observed"
+        for output in task.task_spec.requested_outputs
+    )
+    verified = (
+        bool(task.result.get("verified"))
+        and task.status == TaskStatus.SUCCEEDED
+        and evidence_complete
+        and outputs_complete
+    )
+    return {
+        "status": task.status.value,
+        "summary": task.result.get("summary"),
+        "verified": verified,
+        "observations": observations,
+        "requirements": safe_requirements,
+        "steps": task.result.get("steps", task.step_number),
+    }
+
+
+def _public_contract(task) -> dict[str, object]:
+    spec = task.task_spec
+    return {
+        "version": spec.contract_version,
+        "status": task.contract_status.value,
+        "intent": spec.intent,
+        "target": {"app": spec.app, "package": spec.app_package},
+        "policy": spec.policy.model_dump(mode="json") if spec.policy else None,
+        "requested_outputs": [output.model_dump(mode="json") for output in spec.requested_outputs],
+        "completion": [
+            {"type": item.type, "field_role": item.field_role, "output_key": item.output_key}
+            for item in spec.completion
+        ],
+        "errors": task.contract_errors,
+    }
+
+
+def _public_evidence(evidence: dict[str, object]) -> dict[str, object]:
+    source = evidence.get("source")
+    safe_source = {}
+    if isinstance(source, dict):
+        allowed = {
+            "snapshot_id", "package", "semantic_role", "label", "observed_value", "confidence", "verification",
+        }
+        safe_source = {key: source[key] for key in allowed if key in source}
+        if "observed_value" in safe_source:
+            safe_source["observed_value"] = _safe_observed_value(safe_source["observed_value"])
+    return {
+        "requirement": evidence.get("requirement"),
+        "kind": evidence.get("kind"),
+        "output_key": evidence.get("output_key"),
+        "source": safe_source,
+    }
+
+
+def _safe_observed_value(value: object) -> object:
+    """Allow semantic scalar output, never arbitrary nested UI payloads."""
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value[:4000]
+    if isinstance(value, list) and all(item is None or isinstance(item, (bool, int, float, str)) for item in value):
+        return [item[:4000] if isinstance(item, str) else item for item in value[:100]]
+    if isinstance(value, dict) and set(value).issubset({"title", "items", "value", "state"}):
+        return {key: _safe_observed_value(item) for key, item in value.items()}
+    return None
 
 
 def _public_event(event: dict[str, object]) -> dict[str, object]:

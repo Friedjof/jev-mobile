@@ -18,8 +18,15 @@ from ..providers.base import ProviderUnavailable
 from ..requirements import RequirementEvaluator
 from ..requirements.generators import generate_requirements
 from ..state.normalize import normalize
+from ..state.models import SemanticState
 from ..task_store import MobileTask, TaskStatus, TaskStore
-from ..tasks import RequirementStatus, TaskSpec, task_spec_from_goal
+from ..tasks import (
+    RequirementStatus,
+    TaskContractStatus,
+    TaskSpec,
+    task_spec_from_goal,
+    validate_task_contract,
+)
 from ..tracing.trace import TraceWriter
 from .grounding import EntityOwnership, InteractionContext, context_type, evaluate_safe_creation_context, ownership_for
 from ..safety.lifecycle_reset import LifecycleResetDecision, evaluate_reset_safety, reset_question
@@ -43,6 +50,9 @@ class MobileAgent:
         task = self.store.get(task_id)
         if not task or task.status in {TaskStatus.CANCELLED, TaskStatus.SUCCEEDED, TaskStatus.FAILED}: return
         task.status, task.started_at = TaskStatus.RUNNING, task.started_at or datetime.now(UTC); self.store.save(task)
+        task = await self._resolve_task_contract(task)
+        if task is None:
+            return
         declared_requirements = [item for item in generate_requirements(task.task_spec) if item.required]
         if not declared_requirements:
             task.status = TaskStatus.FAILED
@@ -161,6 +171,11 @@ class MobileAgent:
                     catalog = ActionCatalog.build(before, refs)
                     safe_creation = evaluate_safe_creation_context(before, target_package=task.task_spec.app_package, ownership=ownership, actions=catalog.actions)
                     requirements = evaluator.evaluate(task.task_spec, before)
+                    observed_evidence = {
+                        requirement.key: self._requirement_evidence(requirement)
+                        for requirement in requirements
+                        if requirement.status == RequirementStatus.SATISFIED and requirement.evidence
+                    }
                     # A requirement verified in its correct semantic context
                     # remains evidenced when navigation later hides that field.
                     for requirement in requirements:
@@ -174,8 +189,19 @@ class MobileAgent:
                             persisted.reason = "entity found outside editor; reopening required"
                         elif persistence_list_seen and editor_open and any(e.editable and (e.value or "") == (task.task_spec.title or "") for e in before.elements):
                             persisted.status = RequirementStatus.SATISFIED; persisted.reason = "content independently re-observed after reopening"
+                            persisted.evidence = {
+                                "snapshot_id": before.raw_snapshot_id,
+                                "package": before.app,
+                                "semantic_role": "entity_editor",
+                                "label": "reopened entity",
+                                "observed_value": task.task_spec.title,
+                                "confidence": 1.0,
+                                "verification": "independently_reopened",
+                            }
+                            observed_evidence[persisted.key] = self._requirement_evidence(persisted)
                         elif persistence_list_seen:
                             persisted.status = RequirementStatus.NEEDS_VERIFICATION
+                    task.requirement_evidence.update(observed_evidence)
                     task.requirements = {r.key: r.status for r in requirements}
                     task.current_subgoal = evaluator.current_subgoal(requirements)
                     orientation = "READY" if safe_creation["safe"] else task.agent_context.get("orientation", "UNORIENTED")
@@ -189,8 +215,16 @@ class MobileAgent:
                     self.store.save(task); self.store.event(task.id, "SNAPSHOT_OBSERVED", {"step": step, "snapshot": catalog.snapshot_id})
                     required_requirements = [r for r in requirements if r.required]
                     if required_requirements and all(r.status == RequirementStatus.SATISFIED for r in required_requirements):
+                        missing_evidence = [r.key for r in required_requirements if not task.requirement_evidence.get(r.key)]
+                        if missing_evidence:
+                            task.current_subgoal = "Collect observable evidence for all required criteria"
+                            self.store.event(task.id, "VERIFICATION_EVIDENCE_INCOMPLETE", {
+                                "missing_requirements": missing_evidence,
+                            }, task.worker_id)
+                            self.store.save(task)
+                            continue
                         task.status = TaskStatus.SUCCEEDED
-                        task.result = {"summary": "Task completed and verified.", "requirements": {r.key: r.model_dump(mode="json") for r in requirements}, "steps": step, "trace_path": str(trace.path)}
+                        task.result = self._verified_result(task, requirements, step, trace)
                         break
                     context = before.model_copy(update={"agent_context": {"task_spec": task.task_spec.model_dump(mode="json"), "current_subgoal": task.current_subgoal, "requirements": {r.key: r.status.value for r in requirements}, "history": history[-6:]}})
                     candidates, mapping = self._candidates(catalog, refs, requirements, task.task_spec, before.app, history, before.fingerprint, interaction_context, ownership, orientation)
@@ -241,6 +275,107 @@ class MobileAgent:
 
     @staticmethod
     async def _observe(device: DeviceAdapter): return normalize(await device.observe())
+
+    async def _resolve_task_contract(self, task: MobileTask) -> MobileTask | None:
+        validation = validate_task_contract(task.task_spec)
+        if validation.valid:
+            if task.contract_status != TaskContractStatus.READY or task.contract_errors:
+                task.contract_status = TaskContractStatus.READY
+                task.contract_errors = []
+                self.store.save(task)
+            return task
+
+        interpretation = None
+        interpret = getattr(self.provider, "interpret_task", None)
+        if callable(interpret):
+            try:
+                interpretation = await interpret(
+                    task.instruction,
+                    SemanticState(app=None, elements=[], fingerprint="task-contract"),
+                )
+            except ProviderUnavailable as error:
+                task.status = TaskStatus.RECOVERING
+                task.failure_reason = str(error)
+                task.contract_errors = validation.errors
+                task.lease_expires_at = datetime.fromtimestamp(time.time() + 20, UTC)
+                self.store.save(task)
+                self.store.event(task.id, "TASK_CONTRACT_INTERPRETATION_DEFERRED", {
+                    "reason": str(error),
+                }, task.worker_id)
+                return None
+        if interpretation is not None:
+            proposed = interpretation.to_task_spec()
+            proposed_validation = validate_task_contract(proposed)
+            if proposed_validation.valid:
+                task.task_spec = proposed
+                task.contract_status = TaskContractStatus.READY
+                task.contract_errors = []
+                task.failure_reason = None
+                self.store.save(task)
+                self.store.event(task.id, "TASK_CONTRACT_RESOLVED", {
+                    "contract_version": proposed.contract_version,
+                    "intent": proposed.intent,
+                    "target_app": proposed.app,
+                    "policy": proposed.policy.mode.value if proposed.policy else None,
+                    "requirements": len(proposed.completion),
+                }, task.worker_id)
+                return task
+            validation = proposed_validation
+
+        declared = [item for item in generate_requirements(task.task_spec) if item.required]
+        reason = "NO_VERIFIABLE_COMPLETION_CRITERIA" if not declared else "TASK_CONTRACT_INCOMPLETE"
+        task.status = TaskStatus.FAILED
+        task.contract_status = TaskContractStatus.UNSUPPORTED
+        task.contract_errors = validation.errors
+        task.failure_reason = reason
+        task.finished_at = datetime.now(UTC)
+        self.store.save(task)
+        event_type = reason if reason == "NO_VERIFIABLE_COMPLETION_CRITERIA" else "TASK_CONTRACT_UNSUPPORTED"
+        self.store.event(task.id, event_type, {
+            "reason": reason,
+            "errors": validation.errors,
+        }, task.worker_id)
+        return None
+
+    @staticmethod
+    def _requirement_evidence(requirement) -> dict[str, object]:
+        return {
+            "requirement": requirement.key,
+            "kind": requirement.kind,
+            "output_key": requirement.output_key,
+            "source": dict(requirement.evidence),
+        }
+
+    @staticmethod
+    def _verified_result(task: MobileTask, requirements, step: int, trace: TraceWriter) -> dict[str, object]:
+        observations: dict[str, object] = {}
+        for output in task.task_spec.requested_outputs:
+            matching = next(
+                (evidence for evidence in task.requirement_evidence.values() if evidence.get("output_key") == output.key),
+                None,
+            )
+            source = matching.get("source", {}) if matching else {}
+            observations[output.key] = {
+                "status": "observed" if matching else "unknown",
+                "value": source.get("observed_value") if isinstance(source, dict) else None,
+            }
+        return {
+            "summary": "Task completed and verified.",
+            "verified": True,
+            "observations": observations,
+            "requirements": [
+                {
+                    "key": requirement.key,
+                    "kind": requirement.kind,
+                    "status": requirement.status.value,
+                    "evidence": task.requirement_evidence[requirement.key],
+                }
+                for requirement in requirements
+                if requirement.required
+            ],
+            "steps": step,
+            "trace_path": str(trace.path),
+        }
 
     @staticmethod
     def _candidates(catalog, refs, requirements, spec, current_package, history, state_fingerprint, interaction_context=InteractionContext.UNKNOWN, ownership=EntityOwnership.UNKNOWN, orientation="UNORIENTED"):

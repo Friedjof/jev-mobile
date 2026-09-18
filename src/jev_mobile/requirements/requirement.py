@@ -9,6 +9,7 @@ class Requirement(BaseModel):
     key: str
     kind: str
     expected: str | None = None
+    output_key: str | None = None
     required: bool = True
     status: RequirementStatus = RequirementStatus.UNSATISFIED
     evidence: dict[str, object] = Field(default_factory=dict)

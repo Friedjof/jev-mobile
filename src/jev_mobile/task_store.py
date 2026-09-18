@@ -9,9 +9,9 @@ from enum import StrEnum
 from pathlib import Path
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
-from .tasks import RequirementStatus, TaskSpec
+from .tasks import RequirementStatus, TaskContractStatus, TaskSpec, contract_status_for
 
 
 class TaskStatus(StrEnum):
@@ -29,12 +29,15 @@ class MobileTask(BaseModel):
     id: str
     instruction: str
     task_spec: TaskSpec
+    contract_status: TaskContractStatus | None = None
+    contract_errors: list[str] = Field(default_factory=list)
     status: TaskStatus = TaskStatus.QUEUED
     created_at: datetime
     started_at: datetime | None = None
     finished_at: datetime | None = None
     current_subgoal: str | None = None
     requirements: dict[str, RequirementStatus] = Field(default_factory=dict)
+    requirement_evidence: dict[str, dict[str, object]] = Field(default_factory=dict)
     result: dict[str, object] | None = None
     failure_reason: str | None = None
     waiting_reason: str | None = None
@@ -47,6 +50,13 @@ class MobileTask(BaseModel):
     step_number: int = 0
     agent_context: dict[str, object] = Field(default_factory=dict)
     pending_mutation: dict[str, object] | None = None
+
+    @model_validator(mode="after")
+    def migrate_contract_status(self) -> "MobileTask":
+        """Older checkpoints gain a deterministic contract state on read."""
+        if self.contract_status is None:
+            self.contract_status = contract_status_for(self.task_spec)
+        return self
 
 
 class TaskStore:
@@ -78,9 +88,13 @@ class TaskStore:
 
     def create(self, instruction: str, task_spec: TaskSpec) -> MobileTask:
         task = MobileTask(id=f"task_{uuid4().hex}", instruction=instruction, task_spec=task_spec,
-                          created_at=datetime.now(UTC))
+                          contract_status=contract_status_for(task_spec), created_at=datetime.now(UTC))
         self.save(task)
-        self.event(task.id, "TASK_QUEUED", {"instruction": instruction})
+        self.event(task.id, "TASK_QUEUED", {
+            "instruction": instruction,
+            "contract_status": task.contract_status.value,
+            "contract_version": task.task_spec.contract_version,
+        })
         return task
 
     def get(self, task_id: str) -> MobileTask | None:
