@@ -9,6 +9,9 @@ on:
       - "pyproject.toml"
       - "uv.lock"
       - "Dockerfile"
+      - "docker-compose.yml"
+      - "deploy/docker/**"
+      - "android/jev-mobile-test-app/**"
       - ".dockerignore"
       - ".github/workflows/python-docker.yml"
   pull_request:
@@ -18,6 +21,9 @@ on:
       - "pyproject.toml"
       - "uv.lock"
       - "Dockerfile"
+      - "docker-compose.yml"
+      - "deploy/docker/**"
+      - "android/jev-mobile-test-app/**"
       - ".dockerignore"
       - ".github/workflows/python-docker.yml"
 
@@ -54,7 +60,7 @@ jobs:
           from jev_mobile.mcp_server import server
 
           names = {tool.name for tool in asyncio.run(server.list_tools())}
-          assert {"mobile_agent_inspect", "mobile_agent_decide", "mobile_agent_run"} <= names
+          assert names == {"start_task", "get_task", "get_task_events", "cancel_task", "answer_task", "get_device_status"}
           print("MCP tools:", ", ".join(sorted(names)))
           PY
       - uses: docker/setup-buildx-action@v3

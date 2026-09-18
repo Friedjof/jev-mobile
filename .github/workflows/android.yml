@@ -5,10 +5,12 @@ on:
     branches: ["**"]
     paths:
       - "android/jev-mobile-bridge/**"
+      - "android/jev-mobile-test-app/**"
       - ".github/workflows/android.yml"
   pull_request:
     paths:
       - "android/jev-mobile-bridge/**"
+      - "android/jev-mobile-test-app/**"
       - ".github/workflows/android.yml"
 
 permissions:
@@ -32,6 +34,8 @@ jobs:
         uses: gradle/actions/wrapper-validation@v4
       - name: Lint and build debug APK
         run: ./gradlew --no-daemon lint assembleDebug
+      - name: Lint and build Android acceptance fixture
+        run: ./gradlew --no-daemon :test-app:lint :test-app:assembleDebug
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:

@@ -38,7 +38,7 @@ jobs:
           from jev_mobile.mcp_server import server
 
           names = {tool.name for tool in asyncio.run(server.list_tools())}
-          assert {"mobile_agent_inspect", "mobile_agent_decide", "mobile_agent_run"} <= names
+          assert names == {"start_task", "get_task", "get_task_events", "cancel_task", "answer_task", "get_device_status"}
           PY
       - uses: actions/setup-java@v4
         with:
@@ -50,6 +50,9 @@ jobs:
       - name: Lint and build installable APK
         working-directory: android/jev-mobile-bridge
         run: ./gradlew --no-daemon lint assembleDebug
+      - name: Build Android acceptance fixture
+        working-directory: android/jev-mobile-bridge
+        run: ./gradlew --no-daemon :test-app:lint :test-app:assembleDebug
       - name: Name release APK
         run: cp android/jev-mobile-bridge/app/build/outputs/apk/debug/app-debug.apk "jev-mobile-bridge-${GITHUB_REF_NAME}-debug.apk"
       - uses: docker/setup-buildx-action@v3
