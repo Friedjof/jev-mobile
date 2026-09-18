@@ -9,9 +9,17 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime
+import argparse
+import os
 from typing import Literal
 
 from mcp.server.mcpserver import MCPServer
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route
+import uvicorn
 
 from .actions.builder import build_action_page
 from .config import Settings
@@ -292,9 +300,52 @@ async def mobile_agent_run(
     }
 
 
+class _McpHttpSecurityMiddleware(BaseHTTPMiddleware):
+    """Restrict internal HTTP MCP access without weakening Host validation."""
+
+    def __init__(self, app, *, origins: set[str], bearer_token: str | None) -> None:
+        super().__init__(app); self.origins, self.bearer_token = origins, bearer_token
+
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path != "/health":
+            origin = request.headers.get("origin")
+            if origin and origin not in self.origins:
+                return JSONResponse({"error": "origin not allowed"}, status_code=403)
+            if self.bearer_token and request.headers.get("authorization") != f"Bearer {self.bearer_token}":
+                return JSONResponse({"error": "bearer token required"}, status_code=401)
+        return await call_next(request)
+
+
+async def _health(_: Request) -> JSONResponse:
+    return JSONResponse({"ok": TaskStore().healthcheck()})
+
+
+def run_streamable_http(host: str, port: int) -> None:
+    """Serve the same six-tool MCP instance as stateless Streamable HTTP."""
+    allowed_hosts = {item.strip() for item in os.getenv("JEV_MOBILE_MCP_ALLOWED_HOSTS", "jev-mobile-mcp,localhost,127.0.0.1").split(",") if item.strip()}
+    allowed_origins = {item.strip() for item in os.getenv("JEV_MOBILE_MCP_ALLOWED_ORIGINS", "").split(",") if item.strip()}
+    # JSON responses are the preferred stateless deployment.  Some clients
+    # require the standard streaming response framing, so compatibility can be
+    # selected explicitly without changing task or tool semantics.
+    json_response = os.getenv("JEV_MOBILE_MCP_JSON_RESPONSE", "true").casefold() in {"1", "true", "yes"}
+    app = server.streamable_http_app(streamable_http_path="/mcp", json_response=json_response, stateless_http=True, host=host)
+    app.router.routes.append(Route("/health", _health, methods=["GET"]))
+    app.add_middleware(_McpHttpSecurityMiddleware, origins=allowed_origins, bearer_token=os.getenv("JEV_MOBILE_MCP_BEARER_TOKEN") or None)
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(allowed_hosts))
+    uvicorn.run(app, host=host, port=port, log_level="info")
+
+
 def main() -> None:
-    """Run Jev Mobile as a stdio MCP server."""
-    server.run(transport="stdio")
+    """Run Jev Mobile MCP over stdio or stateless Streamable HTTP."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--transport", choices=("stdio", "streamable-http"), default="stdio")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8851)
+    args = parser.parse_args()
+    if args.transport == "stdio":
+        server.run(transport="stdio")
+    else:
+        run_streamable_http(args.host, args.port)
 
 
 if __name__ == "__main__":

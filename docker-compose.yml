@@ -54,3 +54,41 @@ services:
     # Intentionally no USB mount, device cgroup rule, ADB key mount, network
     # port or Docker socket. MCP communicates over stdio only.
     network_mode: none
+
+  mcp-http:
+    image: jev-mobile:local
+    build:
+      context: .
+      args:
+        JEV_UID: ${JEV_MOBILE_UID:-1000}
+        JEV_GID: ${JEV_MOBILE_GID:-1000}
+    command: ["mcp", "--transport", "streamable-http", "--host", "0.0.0.0", "--port", "8851"]
+    restart: unless-stopped
+    init: true
+    env_file:
+      - ${JEV_MOBILE_ENV_FILE:?Set JEV_MOBILE_ENV_FILE to an external env file}
+    environment:
+      JEV_MOBILE_DB: /data/jev-mobile.db
+      HOME: /home/jev
+      JEV_MOBILE_MCP_ALLOWED_HOSTS: jev-mobile-mcp,localhost,127.0.0.1
+      JEV_MOBILE_MCP_JSON_RESPONSE: "false"
+    volumes:
+      - ${JEV_MOBILE_DATA_DIR:?Set JEV_MOBILE_DATA_DIR to a local host directory}:/data:rw
+    expose:
+      - "8851"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8851/health').read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      default:
+      openclaw-net:
+        aliases:
+          - jev-mobile-mcp
+
+networks:
+  openclaw-net:
+    external: true
+    name: ${JEV_MOBILE_OPENCLAW_NETWORK:-openclaw-net}

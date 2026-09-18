@@ -312,6 +312,21 @@ OpenClaw no USB, ADB, Portal credentials or Docker socket. Register precisely
 the six tools above; the concrete OpenClaw command is documented in the overlay
 README.
 
+For container-to-container deployments, Streamable HTTP is preferred over a
+spawned stdio child. Start the dedicated `mcp-http` Compose service; it exposes
+only `http://jev-mobile-mcp:8851/mcp` on the internal `openclaw-net` Docker
+network (no host port). Register it explicitly as Streamable HTTP, for example:
+
+```text
+openclaw mcp add jev-mobile --transport streamable-http \
+  --url http://jev-mobile-mcp:8851/mcp \
+  --include start_task,get_task,get_task_events,cancel_task,answer_task,get_device_status
+```
+
+The service is stateless with respect to MCP sessions: SQLite remains the
+durable source of truth. It has no USB, ADB key or Docker socket. The stdio
+overlay remains supported for clients that cannot use internal HTTP.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

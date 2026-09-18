@@ -33,6 +33,15 @@ task_app = typer.Typer(no_args_is_help=True)
 app.add_typer(task_app, name="task")
 
 
+@app.command("mcp")
+def mcp(transport: str = typer.Option("stdio"), host: str = typer.Option("127.0.0.1"), port: int = typer.Option(8851)) -> None:
+    """Run the public MCP server without exposing Android controls."""
+    from .mcp_server import main
+    import sys
+    sys.argv = ["jev-mobile-mcp", "--transport", transport, "--host", host, "--port", str(port)]
+    main()
+
+
 _PORTAL_ACCESSIBILITY_COMPONENT = "com.mobilerun.portal/.service.MobilerunAccessibilityService"
 
 
