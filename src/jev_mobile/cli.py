@@ -33,6 +33,17 @@ task_app = typer.Typer(no_args_is_help=True)
 app.add_typer(task_app, name="task")
 
 
+_PORTAL_ACCESSIBILITY_COMPONENT = "com.mobilerun.portal/.service.MobilerunAccessibilityService"
+
+
+def _portal_accessibility_enabled(value: str) -> bool:
+    """Accept Android's short and fully-qualified component spellings."""
+    components = {component.strip() for component in value.split(":") if component.strip()}
+    return _PORTAL_ACCESSIBILITY_COMPONENT in components or (
+        "com.mobilerun.portal/com.mobilerun.portal.service.MobilerunAccessibilityService" in components
+    )
+
+
 def _provider(name: str, settings: Settings):
     if name == "heuristic": return HeuristicProvider()
     if name == "mock": return MockProvider()
@@ -84,7 +95,7 @@ def doctor(
         ok, output = await command("shell", "pm", "path", "com.mobilerun.portal")
         checks.append(("Portal package", "OK" if ok and "package:" in output else "ERROR", output))
         ok, output = await command("shell", "settings", "get", "secure", "enabled_accessibility_services")
-        checks.append(("Portal accessibility", "OK" if "com.mobilerun.portal.service.MobilerunAccessibilityService" in output else "ERROR", output))
+        checks.append(("Portal accessibility", "OK" if _portal_accessibility_enabled(output) else "ERROR", output))
         ok, output = await command("shell", "ime", "list", "-s")
         checks.append(("Portal keyboard", "OK" if "com.mobilerun.portal/.input.MobilerunKeyboardIME" in output else "WARNING", output))
         try:
