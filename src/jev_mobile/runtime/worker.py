@@ -92,7 +92,11 @@ class DurableWorker:
                     reason=failure.reason,
                     recoverable=failure.recoverable,
                 )
-            operational_event(f"task_{task.status.value}", **fields)
+            event_name = {
+                TaskStatus.WAITING_FOR_USER: "task_waiting",
+                TaskStatus.RECOVERING: "task_recovering",
+            }.get(task.status, f"task_{task.status.value}")
+            operational_event(event_name, **fields)
         if task and task.status in {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELLED}:
             # Terminal tasks leave the phone in a neutral state for the next
             # independent request. HOME is non-destructive and deliberately

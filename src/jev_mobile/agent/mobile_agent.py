@@ -312,6 +312,10 @@ class MobileAgent:
                             "provider_unavailable", task_id=task.id, worker_id=task.worker_id,
                             category="PROVIDER_UNAVAILABLE", provider=getattr(self.provider, "name", type(self.provider).__name__),
                         )
+                        operational_event(
+                            "provider_retry_scheduled", task_id=task.id, worker_id=task.worker_id,
+                            provider=getattr(self.provider, "name", type(self.provider).__name__), retry_in_seconds=20,
+                        )
                         return
                     operational_event(
                         "provider_decision", task_id=task.id, worker_id=task.worker_id,
@@ -618,6 +622,11 @@ class MobileAgent:
                     "provider_unavailable", task_id=task.id, worker_id=task.worker_id,
                     category="PROVIDER_UNAVAILABLE", provider=getattr(self.provider, "name", type(self.provider).__name__),
                     phase="task_interpretation",
+                )
+                operational_event(
+                    "provider_retry_scheduled", task_id=task.id, worker_id=task.worker_id,
+                    provider=getattr(self.provider, "name", type(self.provider).__name__),
+                    phase="task_interpretation", retry_in_seconds=20,
                 )
                 return None
         if interpretation is not None:
