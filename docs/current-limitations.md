@@ -42,11 +42,14 @@ root entry, task reset and approved process restart, the task ends with the
 structured `SAFETY_BLOCKED / PERSISTED_FOREIGN_APP_STATE` outcome rather than
 risking user data.
 
-### MCP is generic; OpenClaw registration is not done yet
+### OpenClaw delegates through the generic MCP surface
 
 The public stdio MCP surface provides durable task delegation, progress,
-cancellation, device status and answers. OpenClaw-specific registration and
-parent-agent acceptance testing remain future work.
+cancellation, device status and answers. OpenClaw 2026.9.4 has been validated
+against it through a Docker overlay that shares SQLite only: fixture task
+delegation, durable reconnect, waiting-for-user approval and cancellation all
+run without OpenClaw receiving Android controls. The integration is documented
+in `deploy/openclaw/`.
 
 ### Backend constraints
 
@@ -54,8 +57,6 @@ The OpenAI-compatible planner requires a model and endpoint that support JSON-mo
 
 ## Recommended next milestones
 
-1. Validate Docker deployment and real stdio MCP process boundaries on hardware.
-2. Add a vision-capable escalation provider for screenshot-backed inspection.
-3. Add preview-and-approval text generation for unknown text fields.
-4. Expand the app benchmark suite and recovery/exploration coverage.
-5. Register the public MCP contract with OpenClaw or another parent agent.
+1. Add a vision-capable escalation provider for screenshot-backed inspection.
+2. Add preview-and-approval text generation for unknown text fields.
+3. Expand the app benchmark suite and recovery/exploration coverage.

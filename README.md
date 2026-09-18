@@ -270,8 +270,8 @@ type, or raw accessibility operations.
 
 ## Docker deployment
 
-Docker is an alternative deployment backend; the native systemd worker remains
-supported. The worker is the only container with USB/ADB access. The MCP
+Docker is the primary deployment backend; the native systemd worker remains an
+installed, disabled fallback. The worker is the only container with USB/ADB access. The MCP
 container is stdio-only and reads the shared SQLite task store without an ADB
 key, USB mount, published port, Docker socket, or device cgroup permission.
 
@@ -303,8 +303,14 @@ docker compose run --rm -T mcp
 ```
 
 The parent owns this stdio process while the worker continues independently.
-OpenClaw-specific command configuration is intentionally deferred until its
-actual deployment (host process versus container) is known.
+
+For a containerized OpenClaw deployment, use the minimal
+[`deploy/openclaw/`](deploy/openclaw/) overlay. It adds only the Jev Mobile MCP
+runtime to OpenClaw, mounts the same local `/data/jev-mobile.db`, and lets
+OpenClaw spawn `jev-mobile-mcp` as its own stdio child. It deliberately grants
+OpenClaw no USB, ADB, Portal credentials or Docker socket. Register precisely
+the six tools above; the concrete OpenClaw command is documented in the overlay
+README.
 
 ## License
 

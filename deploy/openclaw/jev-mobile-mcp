@@ -1,0 +1,3 @@
+#!/bin/sh
+# OpenClaw's stdio MCP child.  It intentionally has no ADB/USB dependencies.
+exec /opt/jev-mobile/.venv/bin/python -m jev_mobile.mcp_server "$@"
