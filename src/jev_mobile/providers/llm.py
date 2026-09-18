@@ -14,11 +14,19 @@ class LLMProvider:
     name = "llm"
     def __init__(self, base_url: str | None, api_key: str | None, model: str | None,
                  system_prompt: str | None = None) -> None:
-        if not all((base_url, api_key, model)): raise ProviderUnavailable("LLM_BASE_URL, LLM_API_KEY, and LLM_MODEL are required")
-        self.base_url, self.api_key, self.model = base_url.rstrip("/"), api_key, model
+        self.base_url = base_url.rstrip("/") if base_url else None
+        self.api_key, self.model = api_key, model
         self.system_prompt = system_prompt
 
+    def readiness_error(self) -> str | None:
+        if all((self.base_url, self.api_key, self.model)):
+            return None
+        return "PROVIDER_UNAVAILABLE: LLM_BASE_URL, LLM_API_KEY, and LLM_MODEL are required"
+
     async def decide(self, goal: str, state: SemanticState, actions: list[CandidateAction]) -> Decision:
+        readiness_error = self.readiness_error()
+        if readiness_error:
+            raise ProviderUnavailable(readiness_error)
         payload = {"model": self.model, "response_format": {"type": "json_object"}, "messages": [
             {"role": "system", "content": decision_policy(self.system_prompt) + "\n\nReturn JSON: {action_id, confidence}."},
             {"role": "user", "content": json.dumps({"goal": goal, "state": state.model_dump(mode="json"), "actions": [a.model_dump(mode="json") for a in actions]})},

@@ -26,6 +26,11 @@ class SystemOneLLMProvider:
         self._model = model
         self._system_prompt = system_prompt
 
+    def readiness_error(self) -> str | None:
+        if self._api_key and self._model:
+            return None
+        return "PROVIDER_UNAVAILABLE: LLM_API_KEY and LLM_MODEL are required"
+
     async def decide(self, goal: str, state: SemanticState, actions: list[CandidateAction]) -> Decision:
         if not self._api_key or not self._model:
             raise ProviderUnavailable("LLM_API_KEY and LLM_MODEL are required for system-one-llm")

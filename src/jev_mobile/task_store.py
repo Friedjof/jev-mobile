@@ -124,6 +124,16 @@ class TaskStore:
         self.event(task.id, "TASK_STARTED", {"worker_id": worker_id}, worker_id, device_serial)
         return task
 
+    def has_claimable_task(self, device_serial: str) -> bool:
+        """Read-only hint used to avoid expensive device probes while idle."""
+        now = datetime.now(UTC).isoformat()
+        return self._connection.execute(
+            """SELECT 1 FROM tasks WHERE (device_serial IS NULL OR device_serial=?)
+            AND status IN ('queued','recovering') AND (lease_expires_at IS NULL OR lease_expires_at < ?)
+            LIMIT 1""",
+            (device_serial, now),
+        ).fetchone() is not None
+
     def heartbeat(self, task: MobileTask, lease_seconds: float = 20) -> None:
         now = datetime.now(UTC); task.heartbeat_at = now; task.lease_expires_at = datetime.fromtimestamp(now.timestamp()+lease_seconds, UTC); self.save(task)
 
@@ -171,3 +181,15 @@ class TaskStore:
     def healthcheck(self) -> bool:
         """Check local SQLite availability without touching a device."""
         return self._connection.execute("SELECT 1").fetchone() == (1,)
+
+    def readinesscheck(self) -> bool:
+        """Verify SQLite can acquire a short write transaction."""
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            self._connection.execute("UPDATE device_status SET updated_at=updated_at WHERE 0")
+            self._connection.execute("ROLLBACK")
+        except Exception:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            return False
+        return True

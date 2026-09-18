@@ -102,6 +102,9 @@ class JevProvider:
         self._api_key = api_key
         self._system_prompt = system_prompt
 
+    def readiness_error(self) -> str | None:
+        return None if self._api_key else "PROVIDER_UNAVAILABLE: TYPESAFE_API_KEY is not configured"
+
     async def interpret_task(self, goal: str, state: SemanticState) -> TaskInterpretation:
         """Use cheap System-One choices for small remaining intent ambiguities."""
         if not self._api_key:
