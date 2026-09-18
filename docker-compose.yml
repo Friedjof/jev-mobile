@@ -24,7 +24,9 @@ services:
     group_add:
       - "${JEV_MOBILE_USB_GID:-46}"
     healthcheck:
-      test: ["CMD-SHELL", "jev-mobile doctor --backend portal-adb --serial \"$${MOBILE_DEVICE_SERIAL}\""]
+      # Device availability is reported by get_device_status. An unplugged
+      # phone must not cause Docker to restart an otherwise healthy worker.
+      test: ["CMD", "jev-mobile", "health"]
       interval: 30s
       timeout: 15s
       retries: 3

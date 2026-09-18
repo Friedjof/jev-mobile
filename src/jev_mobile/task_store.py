@@ -167,3 +167,7 @@ class TaskStore:
             self.save(task); self.event(task.id, "WORKER_RELEASED", {}, worker_id)
 
     def close(self) -> None: self._connection.close()
+
+    def healthcheck(self) -> bool:
+        """Check local SQLite availability without touching a device."""
+        return self._connection.execute("SELECT 1").fetchone() == (1,)

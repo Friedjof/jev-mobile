@@ -104,6 +104,18 @@ def doctor(
 
 
 @app.command()
+def health() -> None:
+    """Check worker-local runtime dependencies without probing Android."""
+    try:
+        if not TaskStore().healthcheck():
+            raise RuntimeError("TaskStore healthcheck failed")
+    except Exception as error:
+        typer.echo(f"ERROR worker runtime: {error}", err=True)
+        raise typer.Exit(2) from error
+    typer.echo("OK worker runtime and TaskStore")
+
+
+@app.command()
 def worker(serial: str | None = typer.Option(None), backend: str = typer.Option("portal-adb"), provider: str = typer.Option("jev")) -> None:
     """Run the long-lived owner of one physical Android device."""
     async def serve() -> None:
