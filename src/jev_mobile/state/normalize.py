@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import re
 from .fingerprint import semantic_fingerprint
-from .models import DialogInfo, DialogKind, RawDeviceElement, RawDeviceState, SemanticElement, SemanticState
+from .models import (
+    DialogInfo, DialogKind, RawDeviceElement, RawDeviceState, ScrollContext, ScrollPosition,
+    SemanticElement, SemanticState,
+)
 
 
 _SAFE_DISMISS_LABELS = {
@@ -139,11 +142,41 @@ def normalize(raw: RawDeviceState) -> SemanticState:
         else:
             indexed.append(element)
     elements = indexed
+    scroll_contexts: list[ScrollContext] = []
+    for container in [element for element in elements if element.visible and element.scrollable]:
+        actions = {action.upper() for action in container.available_actions}
+        can_up = any(action.endswith("SCROLL_BACKWARD") for action in actions)
+        can_down = any(action.endswith("SCROLL_FORWARD") for action in actions)
+        if can_down and not can_up:
+            position = ScrollPosition.TOP
+        elif can_up and can_down:
+            position = ScrollPosition.MIDDLE
+        elif can_up and not can_down:
+            position = ScrollPosition.BOTTOM
+        else:
+            position = ScrollPosition.UNKNOWN
+        labels = [
+            element.label
+            for element in elements
+            if element.visible and element.label and element.depth > container.depth
+            and (not container.bounds or not element.bounds or (
+                element.bounds.y + element.bounds.height >= container.bounds.y
+                and element.bounds.y <= container.bounds.y + container.bounds.height
+            ))
+        ]
+        scroll_contexts.append(ScrollContext(
+            container_role=container.role,
+            position=position,
+            can_scroll_up=can_up,
+            can_scroll_down=can_down,
+            visible_start=labels[0] if labels else None,
+            visible_end=labels[-1] if labels else None,
+        ))
     state = SemanticState(app=raw.package, screen_hint=raw.activity, elements=elements, fingerprint="",
                           loading=loading, dialog=_dialog(elements), truncated=raw.truncated, raw_snapshot_id=raw.snapshot_id,
                           keyboard_visible=raw.keyboard_visible,
                           focused_element_id=raw.focused_element_id or next(
                               (element.id for element in elements if element.focused), None
                           ),
-                          active_window_id=raw.active_window_id)
+                          active_window_id=raw.active_window_id, scroll_contexts=scroll_contexts)
     return state.model_copy(update={"fingerprint": semantic_fingerprint(state)})

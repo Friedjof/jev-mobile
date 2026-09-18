@@ -32,6 +32,7 @@ class MutationEntry(BaseModel):
     outcome: MutationOutcome | None = None
     transport: str | None = None
     resolved_at: datetime | None = None
+    post_state_fingerprint: str | None = None
 
 
 class MutationJournal:

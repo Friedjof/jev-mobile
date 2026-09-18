@@ -33,7 +33,13 @@ class ActionCatalog(BaseModel):
             capabilities: list[str] = []
             if element.clickable and element.enabled: capabilities.append("activate")
             if element.editable and element.enabled: capabilities.extend(["set_text", "append_text", "clear_text"])
-            if element.scrollable and element.enabled: capabilities.append("scroll")
+            if element.scrollable and element.enabled:
+                accessibility_actions = {action.upper() for action in element.available_actions}
+                can_scroll_down = any(action.endswith("SCROLL_FORWARD") for action in accessibility_actions)
+                can_scroll_up = any(action.endswith("SCROLL_BACKWARD") for action in accessibility_actions)
+                if can_scroll_down: capabilities.append("scroll_down")
+                if can_scroll_up: capabilities.append("scroll_up")
+                if not can_scroll_down and not can_scroll_up: capabilities.append("scroll")
             if not capabilities: continue
             actions.append(CatalogAction(ref=descriptor.ref, label=descriptor.text or element.field_name or element.role,
                          role=element.role, semantic_role=element.field_role or element.role,

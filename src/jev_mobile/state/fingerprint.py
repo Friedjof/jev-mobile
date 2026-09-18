@@ -15,6 +15,7 @@ def semantic_fingerprint(state: SemanticState) -> str:
                       item.focused, item.checkable, item.checked, item.available_actions,
                       item.bounds.bucket() if item.bounds else None, item.depth)
                      for item in state.elements],
+        "scroll_contexts": [context.model_dump(mode="json") for context in state.scroll_contexts],
     }
     encoded = json.dumps(canonical, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     return hashlib.sha256(encoded.encode()).hexdigest()[:20]

@@ -36,8 +36,10 @@ class MutationEngine:
         except MutationOutcomeUnknown:
             # The required observation happens before any possible retry decision.
             state = await self.observe()
+            entry.post_state_fingerprint = state.fingerprint
             return self.journal.resolve_action(entry, MutationOutcome.EXECUTED_CONFIRMED if effect_observed(state) else MutationOutcome.EXECUTED_AMBIGUOUS)
         state = await self.observe()
+        entry.post_state_fingerprint = state.fingerprint
         self._fault("after_post_mutation_observe", entry, fault_callback)
         self._fault("before_mutation_resolve", entry, fault_callback)
         return self.journal.resolve_action(entry, MutationOutcome.EXECUTED_CONFIRMED if effect_observed(state) else MutationOutcome.EXECUTED_NO_EFFECT)

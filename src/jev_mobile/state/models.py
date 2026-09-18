@@ -74,6 +74,22 @@ class DialogInfo(BaseModel):
     safe_dismiss_element_ids: list[str] = Field(default_factory=list)
 
 
+class ScrollPosition(StrEnum):
+    TOP = "top"
+    MIDDLE = "middle"
+    BOTTOM = "bottom"
+    UNKNOWN = "unknown"
+
+
+class ScrollContext(BaseModel):
+    container_role: str
+    position: ScrollPosition
+    can_scroll_up: bool
+    can_scroll_down: bool
+    visible_start: str | None = None
+    visible_end: str | None = None
+
+
 class SemanticElement(BaseModel):
     id: str
     role: str
@@ -121,3 +137,4 @@ class SemanticState(BaseModel):
     active_window_id: int | None = None
     recent_context: list[dict[str, Any]] = Field(default_factory=list)
     agent_context: dict[str, Any] = Field(default_factory=dict)
+    scroll_contexts: list[ScrollContext] = Field(default_factory=list)

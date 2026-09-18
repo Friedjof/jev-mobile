@@ -75,6 +75,26 @@ def test_multiple_observed_values_require_structured_selection() -> None:
     assert selected.candidate is not None and selected.candidate.value == "Phone B"
 
 
+def test_large_shared_container_does_not_turn_unrelated_rows_into_values() -> None:
+    request = InformationRequest(
+        key="device_name", question="What is the device name?",
+        semantic_hints=["device name", "about phone"],
+    )
+    state = normalize(RawDeviceState(package="com.android.settings", elements=[
+        RawDeviceElement(node_id="list", child_ids=["storage", "about"]),
+        RawDeviceElement(node_id="storage", parent_id="list", text="Storage", clickable=True, child_ids=["storage-label"]),
+        RawDeviceElement(node_id="storage-label", parent_id="storage", text="Storage", class_name="TextView"),
+        RawDeviceElement(node_id="about", parent_id="list", text="About phone", clickable=True, child_ids=["about-label", "about-value"]),
+        RawDeviceElement(node_id="about-label", parent_id="about", text="About phone", class_name="TextView"),
+        RawDeviceElement(node_id="about-value", parent_id="about", text="moto g(9) plus", class_name="TextView"),
+    ]))
+
+    match = extract_information(request, state)
+
+    assert match.status == InformationMatchStatus.OBSERVED
+    assert match.candidate is not None and match.candidate.value == "moto g(9) plus"
+
+
 def test_password_and_prohibited_requests_are_never_returned() -> None:
     request = InformationRequest(
         key="password", question="Read password", semantic_hints=["password"],
@@ -121,3 +141,22 @@ def test_read_only_candidate_policy_blocks_writes_and_toggles() -> None:
     assert any(action.kind == ActionKind.TAP and "About phone" in action.label for action in actions)
     assert not any(action.kind == ActionKind.TYPE_TEXT for action in actions)
     assert not any("Enable feature" in action.label for action in actions)
+
+
+def test_read_only_policy_allows_declared_query_only_in_search_field() -> None:
+    spec = task_spec_from_goal("Open Android Settings and read the device name.")
+    state = normalize(RawDeviceState(package="com.android.settings", elements=[
+        RawDeviceElement(node_id="search", hint="Search settings", editable=True),
+        RawDeviceElement(node_id="normal", hint="Profile name", editable=True),
+    ]))
+    registry = SnapshotRefRegistry()
+    catalog = ActionCatalog.build(state, registry)
+
+    actions, _ = MobileAgent._candidates(
+        catalog, registry, [], spec, "com.android.settings", [], state.fingerprint,
+    )
+
+    writes = [action for action in actions if action.kind == ActionKind.TYPE_TEXT]
+    assert len(writes) == 1
+    assert writes[0].text == "device name"
+    assert "role=search" in writes[0].label

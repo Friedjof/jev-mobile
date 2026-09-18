@@ -210,13 +210,23 @@ class PortalAdbDeviceAdapter:
         if isinstance(box, list) and len(box) == 4: box = dict(zip(("left", "top", "right", "bottom"), box))
         left, top = int(box.get("left", box.get("x", 0))), int(box.get("top", box.get("y", 0)))
         right, bottom = int(box.get("right", left + box.get("width", 0))), int(box.get("bottom", top + box.get("height", 0)))
+        actions = [
+            str(action.get("name") or action.get("label") or action.get("id"))
+            if isinstance(action, dict) else str(action)
+            for action in node.get("actionList", [])
+            if isinstance(action, (dict, str, int))
+        ]
         return RawDeviceElement(node_id=str(node.get("id") or node.get("nodeId") or node.get("__jev_id") or "") or None,
             text=node.get("text") or None, content_description=node.get("contentDescription") or node.get("content_description") or None,
             resource_id=node.get("resourceId") or node.get("resource_id") or None, class_name=node.get("className") or node.get("class_name") or None,
             package=node.get("packageName") or node.get("package") or None, bounds=Bounds(x=left, y=top, width=max(0, right-left), height=max(0, bottom-top)),
             clickable=bool(node.get("clickable") or node.get("isClickable")), editable=bool(node.get("editable") or node.get("isEditable")), enabled=bool(node.get("enabled", node.get("isEnabled", True))),
             selected=bool(node.get("selected") or node.get("isSelected")), visible=bool(node.get("visible", node.get("isVisibleToUser", True))), scrollable=bool(node.get("scrollable") or node.get("isScrollable")),
-            focused=bool(node.get("focused") or node.get("isFocused")), checkable=bool(node.get("checkable") or node.get("isCheckable")), checked=bool(node.get("checked") or node.get("isChecked")),
-            hint=node.get("hint") or None, window_id=node.get("windowId") or node.get("window_id"), parent_id=parent,
+            focused=bool(node.get("focused") or node.get("isFocused")), focusable=bool(node.get("focusable") or node.get("isFocusable")),
+            checkable=bool(node.get("checkable") or node.get("isCheckable")), checked=bool(node.get("checked") or node.get("isChecked")),
+            password=bool(node.get("password") or node.get("isPassword")), multiline=bool(node.get("multiLine") or node.get("isMultiLine")),
+            hint=node.get("hint") or None, state_description=node.get("stateDescription") or node.get("state_description") or None,
+            available_actions=actions, window_id=node.get("windowId") or node.get("window_id"), parent_id=parent,
             child_ids=[str(item.get("id") or item.get("nodeId") or f"{node.get('__jev_id')}.{index}")
-                       for index, item in enumerate(node.get("children", [])) if isinstance(item, dict)], depth=depth)
+                       for index, item in enumerate(node.get("children", [])) if isinstance(item, dict)], depth=depth,
+            extras={"collection_info": node.get("collectionInfo")} if node.get("collectionInfo") else {})

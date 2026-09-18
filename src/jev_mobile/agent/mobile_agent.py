@@ -73,7 +73,9 @@ class MobileAgent:
                 "reason": "The task contract contains no required observable completion criteria.",
             }, task.worker_id)
             return
-        refs, journal, evaluator, history = SnapshotRefRegistry(), MutationJournal(), RequirementEvaluator(), []
+        refs, journal, evaluator = SnapshotRefRegistry(), MutationJournal(), RequirementEvaluator()
+        persisted_history = task.agent_context.get("action_history")
+        history = list(persisted_history) if isinstance(persisted_history, list) else []
         persistence_list_seen = False
         trace = TraceWriter(self.settings.trace_dir)
         try:
@@ -112,7 +114,9 @@ class MobileAgent:
                     # A root entry that returns to the same foreign editor is
                     # a lifecycle boundary, not an invitation to keep pressing
                     # Back. Resetting that task may lose user state, so ask.
-                    if (task.agent_context.get("root_attempted") and interaction_context == InteractionContext.EDITOR
+                    create_oriented = task.task_spec.intent.startswith("create")
+                    if (create_oriented and task.agent_context.get("root_attempted")
+                            and interaction_context == InteractionContext.EDITOR
                             and ownership == EntityOwnership.FOREIGN and task.task_spec.app_package):
                         authorization = task.agent_context.get("lifecycle_authorization")
                         if isinstance(authorization, dict) and authorization.get("operation") == "restart_app_process" and not authorization.get("consumed"):
@@ -226,7 +230,9 @@ class MobileAgent:
                     task.requirements = {r.key: r.status for r in requirements}
                     task.current_subgoal = evaluator.current_subgoal(requirements)
                     orientation = "READY" if safe_creation["safe"] else task.agent_context.get("orientation", "UNORIENTED")
-                    if orientation != "READY" and interaction_context == InteractionContext.EDITOR and ownership != EntityOwnership.CURRENT_TASK:
+                    if (create_oriented and orientation != "READY"
+                            and interaction_context == InteractionContext.EDITOR
+                            and ownership != EntityOwnership.CURRENT_TASK):
                         task.current_subgoal = "Reach a safe context for creating a new entity"
                         orientation = "ESCAPING_FOREIGN_CONTEXT"
                     elif orientation == "READY" and any(r.kind == "note_created" and r.status != RequirementStatus.SATISFIED for r in requirements):
@@ -266,6 +272,13 @@ class MobileAgent:
                         return
                     selected = next((a for a in candidates if a.id == decision.action_id), None)
                     if selected is None: raise RuntimeError("Jev selected an invalid action")
+                    self.store.event(task.id, "ACTION_SELECTED", {
+                        "kind": selected.kind.value,
+                        "family": selected.mutation_family.value,
+                        "risk": selected.risk.value,
+                        "goal_directed": selected.goal_directed,
+                        "confidence": decision.confidence,
+                    }, task.worker_id)
                     if selected.kind == ActionKind.REQUEST_INPUT:
                         if not selected.question:
                             raise RuntimeError("REQUEST_INPUT action has no QuestionSpec")
@@ -289,7 +302,29 @@ class MobileAgent:
                         task.agent_context["entity_ownership"] = EntityOwnership.CURRENT_TASK.value
                     task.pending_mutation = None; self.store.save(task); self.store.event(task.id, "MUTATION_RESOLVED", {"id": entry.id, "outcome": entry.outcome.value})
                     signature = self._attempt_signature(action, catalog_target)
-                    history.append({"snapshot": catalog.snapshot_id, "state": before.fingerprint, "subgoal": task.current_subgoal, "action": action.label, "signature": signature, "target_ref": ref, "mutation": entry.outcome.value})
+                    history.append({
+                        "state": before.fingerprint,
+                        "to_state": entry.post_state_fingerprint,
+                        "subgoal": task.current_subgoal,
+                        "action": action.label.split(" (")[0],
+                        "signature": signature,
+                        "family": family.value,
+                        "mutation": entry.outcome.value,
+                        "requirements": tuple(sorted((r.key, r.status.value) for r in requirements)),
+                    })
+                    if self._navigation_cycle(history):
+                        history[-1]["cycle"] = True
+                        self.store.event(task.id, "NAVIGATION_OSCILLATION", {
+                            "from_state": before.fingerprint,
+                            "to_state": entry.post_state_fingerprint,
+                            "action_signature": signature,
+                        }, task.worker_id)
+                        self.store.event(task.id, "RECOVERY_STARTED", {
+                            "category": "NAVIGATION_OSCILLATION",
+                            "suppressed_edge": signature,
+                        }, task.worker_id)
+                    task.agent_context["action_history"] = history[-24:]
+                    self.store.save(task)
                     repeated = [item for item in history[-3:] if item.get("signature") == signature and item.get("state") == before.fingerprint and item["mutation"] == MutationOutcome.EXECUTED_NO_EFFECT.value]
                     if len(repeated) >= 3:
                         self.store.event(task.id, "RECOVERY_STARTED", {"category": "LOOP_DETECTION", "action": action.label})
@@ -440,10 +475,27 @@ class MobileAgent:
         entity_missing = any(r.kind == "note_created" and r.status != RequirementStatus.SATISFIED for r in requirements) and ownership != EntityOwnership.CURRENT_TASK
         policy = getattr(spec, "policy", None)
         read_only = bool(policy and policy.mode == TaskPolicyMode.READ_ONLY)
-        suppressed = {item.get("signature") for item in history if item.get("state") == state_fingerprint and item.get("mutation") == MutationOutcome.EXECUTED_NO_EFFECT.value and sum(1 for other in history if other.get("signature") == item.get("signature") and other.get("state") == state_fingerprint and other.get("mutation") == MutationOutcome.EXECUTED_NO_EFFECT.value) >= 2}
+        suppressed = {
+            item.get("signature")
+            for item in history
+            if item.get("state") == state_fingerprint and (
+                item.get("cycle")
+                or item.get("mutation") == MutationOutcome.EXECUTED_NO_EFFECT.value
+                and sum(
+                    1 for other in history
+                    if other.get("signature") == item.get("signature")
+                    and other.get("state") == state_fingerprint
+                    and other.get("mutation") == MutationOutcome.EXECUTED_NO_EFFECT.value
+                ) >= 2
+            )
+        }
         ordered = sorted(catalog.actions, key=lambda item: (0 if "set_text" in item.capabilities and item.semantic_role == "title" else 1, item.ref))
         for item in ordered:
-            foreign_editor = interaction_context == InteractionContext.EDITOR and ownership != EntityOwnership.CURRENT_TASK
+            foreign_editor = (
+                not read_only
+                and interaction_context == InteractionContext.EDITOR
+                and ownership != EntityOwnership.CURRENT_TASK
+            )
             if foreign_editor:
                 # Existing editor content is read-only for a create task. Only
                 # explicit, non-destructive parent navigation is selectable.
@@ -451,37 +503,68 @@ class MobileAgent:
                 if not (item.semantic_role in {"image", "button"} and any(word in navigation_label for word in ("back", "navigate up", "up", "close", "cancel"))):
                     continue
             if "activate" in item.capabilities:
-                if read_only and not MobileAgent._read_navigation_allowed(item, spec):
-                    continue
-                family = MobileAgent._family_for_activate(item, requirements, ownership)
-                first_label = (item.label or "").casefold().strip().split(maxsplit=1)
-                if ownership == EntityOwnership.CURRENT_TASK and first_label and first_label[0] in {"create", "new", "add", "compose"}:
-                    continue
-                a = CandidateAction(id=f"a{len(actions)}", kind=ActionKind.TAP, label=f"Activate role={item.semantic_role} label={item.label!r} ({item.ref})", risk=item.risk, mutation_family=family)
-                if MobileAgent._attempt_signature(a, item) not in suppressed: actions.append(a); mapping[a.id] = (a, item.ref, item)
+                allow_activate = not read_only or MobileAgent._read_navigation_allowed(item, spec)
+                if allow_activate:
+                    family = MobileAgent._family_for_activate(item, requirements, ownership)
+                    first_label = (item.label or "").casefold().strip().split(maxsplit=1)
+                    if not (
+                        ownership == EntityOwnership.CURRENT_TASK
+                        and first_label and first_label[0] in {"create", "new", "add", "compose"}
+                    ):
+                        a = CandidateAction(id=f"a{len(actions)}", kind=ActionKind.TAP, label=f"Activate role={item.semantic_role} label={item.label!r} ({item.ref})", risk=item.risk, mutation_family=family)
+                        if MobileAgent._attempt_signature(a, item) not in suppressed:
+                            actions.append(a); mapping[a.id] = (a, item.ref, item)
             # An editor already open when this task starts may belong to an
             # unrelated entity.  Do not mutate it until this task has observed
             # creation/existence of its own entity.
-            if "set_text" in item.capabilities and not entity_missing and not foreign_editor and not read_only:
+            if "set_text" in item.capabilities and read_only and item.semantic_role == "search":
+                search_text = next((
+                    request.semantic_hints[0]
+                    for request in spec.information_requests
+                    if request.semantic_hints
+                ), None)
+                if search_text and (item.current_value or "").casefold() != search_text.casefold():
+                    a = CandidateAction(
+                        id=f"a{len(actions)}",
+                        kind=ActionKind.TYPE_TEXT,
+                        label=f'Search for declared information hint in role=search current={item.current_value!r} ({item.ref})',
+                        text=search_text,
+                        risk=ActionRisk.REVERSIBLE,
+                        goal_directed=True,
+                        mutation_family=MutationFamily.TEXT_WRITE,
+                    )
+                    actions.append(a)
+                    mapping[a.id] = (a, item.ref, item)
+            elif "set_text" in item.capabilities and not entity_missing and not foreign_editor and not read_only:
                 for text in texts:
                     a = CandidateAction(id=f"a{len(actions)}", kind=ActionKind.TYPE_TEXT, label=f'Set text "{text}" in role={item.semantic_role} current={item.current_value!r} ({item.ref})', text=text, risk=ActionRisk.REVERSIBLE, mutation_family=MutationFamily.TEXT_WRITE); actions.append(a); mapping[a.id] = (a, item.ref, item)
-            if "scroll" in item.capabilities:
-                a = CandidateAction(id=f"a{len(actions)}", kind=ActionKind.SCROLL_DOWN, label=f"Scroll {item.label} ({item.ref})", mutation_family=MutationFamily.SCROLL); actions.append(a); mapping[a.id] = (a, item.ref, item)
+            if "scroll" in item.capabilities or "scroll_down" in item.capabilities:
+                a = CandidateAction(id=f"a{len(actions)}", kind=ActionKind.SCROLL_DOWN, label=f"Scroll down {item.label} ({item.ref})", mutation_family=MutationFamily.SCROLL)
+                if MobileAgent._attempt_signature(a, item) not in suppressed:
+                    actions.append(a); mapping[a.id] = (a, item.ref, item)
+            if "scroll_up" in item.capabilities:
+                a = CandidateAction(id=f"a{len(actions)}", kind=ActionKind.SCROLL_UP, label=f"Scroll up {item.label} ({item.ref})", mutation_family=MutationFamily.SCROLL)
+                if MobileAgent._attempt_signature(a, item) not in suppressed:
+                    actions.append(a); mapping[a.id] = (a, item.ref, item)
         if catalog.actions:
-            if spec.app_package and current_package != spec.app_package:
+            if spec.app_package and not MobileAgent._same_app_context(current_package, spec.app_package):
                 # Orientation uses root entry, not launcher-icon resume: the
                 # latter may restore a foreign activity task.
-                a = CandidateAction(id=f"a{len(actions)}", kind=ActionKind.OPEN_APP_ROOT, label=f"Open requested app root ({catalog.actions[0].ref})", package=spec.app_package, mutation_family=MutationFamily.NAVIGATION); actions.append(a); mapping[a.id] = (a, catalog.actions[0].ref, catalog.actions[0])
+                a = CandidateAction(id=f"a{len(actions)}", kind=ActionKind.OPEN_APP_ROOT, label=f"Open requested app root ({catalog.actions[0].ref})", package=spec.app_package, mutation_family=MutationFamily.NAVIGATION)
+                if MobileAgent._attempt_signature(a, catalog.actions[0]) not in suppressed:
+                    actions.append(a); mapping[a.id] = (a, catalog.actions[0].ref, catalog.actions[0])
             a = CandidateAction(id=f"a{len(actions)}", kind=ActionKind.BACK, label="Back", mutation_family=MutationFamily.NAVIGATION); actions.append(a); mapping[a.id] = (a, catalog.actions[0].ref, catalog.actions[0])
+            if MobileAgent._attempt_signature(a, catalog.actions[0]) in suppressed:
+                actions.pop(); mapping.pop(a.id)
         # Requirement-aware orientation: once a safe visible creation
         # affordance exists, do not let an unconstrained policy wander back to
         # an old entity or the launcher.  This remains app-independent.
         creates = [action for action in actions if action.mutation_family == MutationFamily.CREATE_ENTITY]
         roots = [action for action in actions if action.kind == ActionKind.OPEN_APP_ROOT]
-        if entity_missing and spec.app_package and current_package != spec.app_package and roots:
+        if entity_missing and spec.app_package and not MobileAgent._same_app_context(current_package, spec.app_package) and roots:
             allowed = {action.id for action in roots}
             return [action for action in actions if action.id in allowed], {key: value for key, value in mapping.items() if key in allowed}
-        if read_only and spec.app_package and current_package != spec.app_package and roots:
+        if read_only and spec.app_package and not MobileAgent._same_app_context(current_package, spec.app_package) and roots:
             allowed = {action.id for action in roots}
             return [action for action in actions if action.id in allowed], {
                 key: value for key, value in mapping.items() if key in allowed
@@ -494,6 +577,31 @@ class MobileAgent:
             actions = [action for action in actions if action.id in allowed]
             mapping = {key: value for key, value in mapping.items() if key in allowed}
         return actions, mapping
+
+    @staticmethod
+    def _same_app_context(current_package: str | None, target_package: str | None) -> bool:
+        if not current_package or not target_package:
+            return False
+        return current_package == target_package or current_package.startswith(f"{target_package}.")
+
+    @staticmethod
+    def _navigation_cycle(history: list[dict[str, object]]) -> bool:
+        """Detect semantic A→B→A and A→B→C→A without snapshot identity."""
+        for length in (2, 3):
+            if len(history) < length:
+                continue
+            edges = history[-length:]
+            if any(edge.get("family") != MutationFamily.NAVIGATION.value for edge in edges):
+                continue
+            if any(edge.get("state") == edge.get("to_state") for edge in edges):
+                continue
+            if any(edges[index].get("to_state") != edges[index + 1].get("state") for index in range(length - 1)):
+                continue
+            states = [edges[0].get("state"), *[edge.get("to_state") for edge in edges]]
+            same_requirements = len({repr(edge.get("requirements")) for edge in edges}) == 1
+            if states[0] == states[-1] and len(set(states[:-1])) > 1 and same_requirements:
+                return True
+        return False
 
     @staticmethod
     def _read_navigation_allowed(item, spec: TaskSpec) -> bool:
@@ -568,6 +676,7 @@ class MobileAgent:
             if action.kind == ActionKind.TAP: return await device.tap(target)
             if action.kind == ActionKind.TYPE_TEXT: return await device.type_text(action.text or "", target)
             if action.kind == ActionKind.SCROLL_DOWN: return await device.swipe("down")
+            if action.kind == ActionKind.SCROLL_UP: return await device.swipe("up")
             if action.kind == ActionKind.BACK: return await device.back()
             if action.kind == ActionKind.LAUNCH_APP: return await device.launch_app(action.package or "")
             if action.kind == ActionKind.OPEN_APP_ROOT:

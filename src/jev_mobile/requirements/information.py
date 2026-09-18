@@ -93,9 +93,11 @@ def extract_information(
         relatives = [
             element for element in visible
             if element.id != label_element.id and (
-                element.parent_id == label_element.parent_id
-                or element.parent_id == label_element.id
+                element.parent_id == label_element.id
                 or label_element.parent_id == element.id
+                or element.parent_id == label_element.parent_id
+                and not label_element.clickable
+                and abs(element.raw_index - label_element.raw_index) <= 2
             )
         ]
         if not relatives:

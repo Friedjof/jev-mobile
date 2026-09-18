@@ -62,6 +62,7 @@ def build_jev_state(
         },
         "recent_context": state.recent_context[-12:],
         "agent_context": state.agent_context,
+        "scroll_contexts": [context.model_dump(mode="json") for context in state.scroll_contexts],
         "dialog": state.dialog.model_dump(mode="json") if state.dialog else None,
     }
 

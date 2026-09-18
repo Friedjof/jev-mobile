@@ -1,4 +1,5 @@
 from jev_mobile.agent.mobile_agent import MobileAgent
+from jev_mobile.actions.models import ActionKind
 from jev_mobile.agent.grounding import EntityOwnership, InteractionContext, context_type, ownership_for
 from jev_mobile.requirements.requirement import Requirement
 from jev_mobile.tasks import RequirementStatus
@@ -38,3 +39,47 @@ def test_foreign_editor_is_not_writable_for_a_fresh_create_task() -> None:
     requirements = [Requirement(key="note_created", kind="note_created", status=RequirementStatus.UNSATISFIED)]
     actions, _ = MobileAgent._candidates(catalog, SnapshotRefRegistry(), requirements, type("S", (), {"app_package": None})(), "x", [], state.fingerprint, InteractionContext.EDITOR, EntityOwnership.FOREIGN)
     assert not any(action.kind.value == "type_text" for action in actions)
+
+
+def test_semantic_reverse_navigation_cycle_is_detected_and_edge_suppressed() -> None:
+    history = [
+        {"state": "A", "to_state": "B", "family": "navigation", "requirements": (("read", "unsatisfied"),)},
+        {"state": "B", "to_state": "A", "family": "navigation", "requirements": (("read", "unsatisfied"),)},
+    ]
+    assert MobileAgent._navigation_cycle(history)
+
+    state = normalize(RawDeviceState(elements=[RawDeviceElement(node_id="root", text="Root", clickable=True)]))
+    registry = SnapshotRefRegistry()
+    catalog = ActionCatalog.build(state, registry)
+    action = type("A", (), {"kind": type("K", (), {"value": "tap"})(), "text": None})()
+    signature = MobileAgent._attempt_signature(action, catalog.actions[0])
+    history = [{"signature": signature, "state": state.fingerprint, "mutation": "executed_confirmed", "cycle": True}]
+    actions, _ = MobileAgent._candidates(
+        catalog, registry, [], type("S", (), {"app_package": None})(), "x", history, state.fingerprint,
+    )
+    assert not any(item.kind.value == "tap" for item in actions)
+
+
+def test_target_package_companion_is_same_app_context() -> None:
+    assert MobileAgent._same_app_context("com.android.settings.intelligence", "com.android.settings")
+    assert not MobileAgent._same_app_context("com.example.other", "com.android.settings")
+
+
+def test_repeated_no_effect_scroll_is_suppressed() -> None:
+    state = normalize(RawDeviceState(elements=[
+        RawDeviceElement(node_id="list", text="Content", scrollable=True),
+    ]))
+    registry = SnapshotRefRegistry()
+    catalog = ActionCatalog.build(state, registry)
+    action = type("A", (), {"kind": type("K", (), {"value": "scroll_down"})(), "text": None})()
+    signature = MobileAgent._attempt_signature(action, catalog.actions[0])
+    history = [
+        {"signature": signature, "state": state.fingerprint, "mutation": "executed_no_effect"},
+        {"signature": signature, "state": state.fingerprint, "mutation": "executed_no_effect"},
+    ]
+
+    actions, _ = MobileAgent._candidates(
+        catalog, registry, [], type("S", (), {"app_package": None})(), "x", history, state.fingerprint,
+    )
+
+    assert not any(item.kind == ActionKind.SCROLL_DOWN for item in actions)
