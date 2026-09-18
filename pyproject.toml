@@ -1,6 +1,6 @@
 [project]
 name = "jev-mobile"
-version = "0.1.1"
+version = "0.1.2"
 description = "Fast, structured Android control loops with pluggable decision providers."
 readme = "README.md"
 requires-python = ">=3.12"
